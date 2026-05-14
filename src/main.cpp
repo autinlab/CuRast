@@ -228,13 +228,15 @@ void initScene() {
 			vec3{0.0f, 0.0f, 0.0f},
 			vec3{1.0f, 0.0f, 0.0f},
 			vec3{1.0f, 1.0f, 0.0f},
+			vec3{0.0f, 1.0f, 0.0f},
 		};
 		vector<vec2> uvs = {
 			vec2{0.0f, 0.0f},
 			vec2{1.0f, 0.0f},
 			vec2{1.0f, 1.0f},
+			vec2{0.0f, 1.0f},
 		};
-		vector<uint32_t> indices = {0, 1, 2};
+		vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
 		int numVertices = positions.size();
 		int numTriangles = indices.size() / 3;
@@ -252,6 +254,8 @@ void initScene() {
 		node->mesh->numVertices = positions.size();
 
 		scene.world->children.push_back(node);
+
+		CuRastSettings::displayAttribute = DisplayAttribute::TRIANGLE_ID;
 
 		// position: 0.8369693760957783, 0.05588397571280396, 0.02743282811653472 
 		Runtime::controls->yaw    = -17.426;

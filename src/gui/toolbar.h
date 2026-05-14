@@ -282,15 +282,18 @@ void CuRast::makeToolbar(){
 				ImGui::SameLine();
 				ImGui::Text("Background:");
 				ImGui::SameLine();
-				static int bg = 1;
+				static int bg = 4;
 				ImGui::RadioButton("blueish##background", &bg, 1);
 				ImGui::SameLine();
 				ImGui::RadioButton("white##background", &bg, 2);
 				ImGui::SameLine();
 				ImGui::RadioButton("black##background", &bg, 3);
+				ImGui::SameLine();
+				ImGui::RadioButton("red##background", &bg, 1);
 				if(bg == 1) CuRastSettings::background = {0.3f, 0.4f, 0.5f, 1.0f};
 				if(bg == 2) CuRastSettings::background = {1.0f, 1.0f, 1.0f, 1.0f};
 				if(bg == 3) CuRastSettings::background = {0.0f, 0.0f, 0.0f, 1.0f};
+				if(bg == 4) CuRastSettings::background = {1.0f, 0.0f, 0.0f, 1.0f};
 				
 				
 				ImGui::Text("Supersampling: ");

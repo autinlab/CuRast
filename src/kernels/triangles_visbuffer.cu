@@ -122,6 +122,42 @@ void rasterize(
 	vec2 b_screen = ndcToScreen(b_ndc, args.target.width, args.target.height);
 	vec2 c_screen = ndcToScreen(c_ndc, args.target.width, args.target.height);
 
+	// bottom-right to top-left
+	// if(triangleIndex == 0)
+	// {
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.0f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 0.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }else if(triangleIndex == 1){
+	// 	a_ndc = {0.5f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.5f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {300.0f, 0.0f};
+	// 	b_screen = {300.0f, 300.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }
+	// bottom-left to top-right
+	// if(triangleIndex == 0)
+	// {
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.0f, 1.0f};
+	// 	c_ndc = {0.5f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 0.0f};
+	// 	c_screen = {300.0f, 300.0f};
+	// }else if(triangleIndex == 1){
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.5f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 300.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }
+	
+
 	// NOTE: To make sure the pixel sample is in the center, 
 	//       we can either add a SAMPLE_OFFSET to the computations or 
 	//       offset the screen-space coordinates.
@@ -240,7 +276,7 @@ void rasterize(
 			for(int fragX = 0; fragX < size_x; fragX++){
 				float v = 1.0f - (s + t);
 				
-				if (s > 0.0f && t > 0.0f && v > 0.0f){
+				if (s >= 0.0f && t >= 0.0f && v >= 0.0f){
 					if (pixelID < numPixels){
 						// Perspective-correct interpolation using precomputed inverses
 						float inv_depth = v * inv_z_a + s * inv_z_b + t * inv_z_c;
@@ -662,7 +698,7 @@ void stage3_drawHugeTriangles(RasterArgs args){
 			float v = 1.0f - (s + t);
 
 			// Only proceed if the fragment is inside the triangle
-			if(s > 0.0f && t > 0.0f && v > 0.0f) {
+			if(s >= 0.0f && t >= 0.0f && v >= 0.0f) {
 				int2 pixelCoords = make_int2(pFrag.x, pFrag.y);
 				int pixelID = toFramebufferIndex(pixelCoords.x, pixelCoords.y, args.target.width);
 
