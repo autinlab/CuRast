@@ -282,7 +282,7 @@ void CuRast::makeToolbar(){
 				ImGui::SameLine();
 				ImGui::Text("Background:");
 				ImGui::SameLine();
-				static int bg = 4;
+				static int bg = 1;
 				ImGui::RadioButton("blueish##background", &bg, 1);
 				ImGui::SameLine();
 				ImGui::RadioButton("white##background", &bg, 2);
