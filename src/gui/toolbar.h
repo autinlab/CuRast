@@ -158,6 +158,8 @@ void CuRast::makeToolbar(){
 				ImGui::Checkbox("Disable Instancing", &CuRastSettings::disableInstancing);
 
 				ImGui::Checkbox("Enable Picking", &CuRastSettings::enableObjectPicking);
+				ImGui::SameLine();
+				ImGui::Checkbox("Inset", &CuRastSettings::showInset);
 				
 				// ImGui::SameLine();
 				// string strMeasure;

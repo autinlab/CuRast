@@ -185,16 +185,16 @@ uint32_t sampleColor_linear(
 	float wx = fmodf(ftx + 0.5f, 1.0f);
 	float wy = fmodf(fty + 0.5f, 1.0f);
 
-	vec4 interpolated = 
-		(1.0f - wx) * (1.0f - wy) * t00 + 
-		wx * (1.0f - wy) * t10 + 
-		(1.0f - wx) * wy * t01 + 
+	vec4 interpolated =
+		(1.0f - wx) * (1.0f - wy) * t00 +
+		wx * (1.0f - wy) * t10 +
+		(1.0f - wx) * wy * t01 +
 		wx * wy * t11;
 
 	rgba[0] = interpolated.r;
 	rgba[1] = interpolated.g;
 	rgba[2] = interpolated.b;
-	rgba[3] = 255;
+	rgba[3] = interpolated.a;
 
 
 	return color;
@@ -880,6 +880,9 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		}else if(rasterizationSettings.displayAttribute == DisplayAttribute::TEXTURE && mesh.uvs){
 			if(!mesh.texture.huffmanTables){
 				color = sampleColor_linear(data, width, height, uv);
+
+				// Color frags that should have been discarded in pink
+				// if(color >> 24 < 128) color = 0xffff00ff;
 			}else{
 				// uint32_t mcu = uvToMCUIndex(width, height, uv.x, uv.y);
 				int tx = (int(uv.x * width) % width);
@@ -1112,10 +1115,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		if(p_00 != p_10) color = 0xffff00ff;
 		if(p_00 != p_01) color = 0xffff00ff;
 
-		// for(int dx : {0, 1})
-		// for(int dy : {0, 1})
-		for(int dx : {-1, 0, 1})
-		for(int dy : {-1, 0, 1})
+		for(int dx : {0, 1})
+		for(int dy : {0, 1})
+		// for(int dx : {-1, 0, 1})
+		// for(int dy : {-1, 0, 1})
 		{
 			int pid_neighbor = clamp(toFramebufferIndex(x + dx, y + dy, c_target.width), 0u, numPixels - 1);
 			uint32_t p_neighbor = c_target.framebuffer[pid_neighbor] & 0xffffffff;
@@ -1151,6 +1154,7 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 	DeviceState* state,
 	bool enableEDL,
 	bool enableSSAO,
+	bool showInset,
 	uint32_t backgroundColor
 ) {
 	auto grid = cg::this_grid();
@@ -1166,30 +1170,90 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 		if(x >= source.width) return;
 		if(y >= source.height) return;
 
-		uint64_t pixel = c_target.colorbuffer[pixelID];
-		float depth = __uint_as_float(pixel >> 32);
-		uint32_t color = pixel & 0xffffffff;
+		auto sample = [&](int x, int y){
+			if(x < 0) return uint32_t(0);
+			if(y < 0) return uint32_t(0);
+			if(x >= source.width) return uint32_t(0);
+			if(y >= source.height) return uint32_t(0);
 
-		float edl = 1.0f;
-		float ssao = 1.0f;
+			int pixelID = toFramebufferIndex(x, y, source.width);
 
-		if(enableEDL){
-			edl = getEdlShadingFactor(c_target.colorbuffer, depth, x, y, 1);
-		}
+			uint64_t pixel = c_target.colorbuffer[pixelID];
+			float depth = __uint_as_float(pixel >> 32);
+			uint32_t sampleColor = pixel & 0xffffffff;
 
-		if(enableSSAO){
-			ssao = ssaoShadeBuffer[pixelID] * 0.4f + 0.6f;
-		}
+			float edl = 1.0f;
+			float ssao = 1.0f;
 
-		if(isinf(depth)) color = backgroundColor;
+			if(enableEDL){
+				edl = getEdlShadingFactor(c_target.colorbuffer, depth, x, y, 1);
+			}
 
-		float shade = edl * ssao;
-		uint8_t* rgba = (uint8_t*)&color;
-		rgba[0] = shade * float(rgba[0]);
-		rgba[1] = shade * float(rgba[1]);
-		rgba[2] = shade * float(rgba[2]);
+			if(enableSSAO){
+				ssao = ssaoShadeBuffer[pixelID] * 0.4f + 0.6f;
+			}
 
+			if(isinf(depth)) sampleColor = backgroundColor;
+
+			float shade = edl * ssao;
+
+			uint8_t* rgba = (uint8_t*)&sampleColor;
+			rgba[0] = shade * float(rgba[0]);
+			rgba[1] = shade * float(rgba[1]);
+			rgba[2] = shade * float(rgba[2]);
+			rgba[3] = 255;
+
+			return sampleColor;
+		};
+
+		uint32_t color = sample(x, y);
 		surf2Dwrite(color, gl_desktop, x * 4, y);
+
+		if(showInset){
+			struct Rect{
+				float x;
+				float y;
+				float width;
+				float height;
+			};
+			float insetSize = 32;
+			Rect insetSource = {
+				mouseX - insetSize / 2,
+				mouseY - insetSize / 2,
+				insetSize,
+				insetSize,
+			};
+			Rect insetTarget = {
+				0, 0,
+				insetSize * 16, insetSize * 16
+			};
+
+			float u = (float(x) - insetTarget.x) / insetTarget.width;
+			float v = (float(y) - insetTarget.y) / insetTarget.height;
+
+			if((u >= 0.0f && u <= 1.0f) && (v >= 0.0f && v <= 1.0f))
+			{
+				int source_x = insetSource.x + u * insetSize;
+				int source_y = insetSource.y + v * insetSize;
+
+				color = sample(source_x, source_y);
+
+				if(u == 1.0f || v == 1.0f){
+					color = 0xffff00ff;
+				}
+			}else if(
+				x == int(insetSource.x)
+				|| x == int(insetSource.x + insetSize)
+				|| y == int(insetSource.y)
+				|| y == int(insetSource.y + insetSize)
+			){
+				color = 0xff0000ff;
+			}
+
+			surf2Dwrite(color, gl_desktop, x * 4, y);
+		}
+
+
 	}else{
 		int target_x = grid.thread_index().x;
 		int target_y = grid.thread_index().y;

@@ -88,6 +88,7 @@ void kernel_computeMipMap(uint32_t* data, int width, int height){
 			int32_t sR = 0;
 			int32_t sG = 0;
 			int32_t sB = 0;
+			int32_t sA = 0;
 
 			auto fetchAdd = [&](int source_x, int source_y){
 				if(source_x >= source_width) return;
@@ -101,6 +102,7 @@ void kernel_computeMipMap(uint32_t* data, int width, int height){
 				sR += rgba[0];
 				sG += rgba[1];
 				sB += rgba[2];
+				sA += rgba[3];
 			};
 
 			fetchAdd(2 * target_x + 0, 2 * target_y + 0);
@@ -111,6 +113,7 @@ void kernel_computeMipMap(uint32_t* data, int width, int height){
 			rgba[0] = sR / 4;
 			rgba[1] = sG / 4;
 			rgba[2] = sB / 4;
+			rgba[3] = sA / 4;
 
 			int64_t target_pixelID = target_x + target_width * target_y;
 

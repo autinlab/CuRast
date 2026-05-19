@@ -28,6 +28,8 @@ using glm::ivec2;
 using glm::i8vec4;
 using glm::vec4;
 
+constexpr bool ENABLE_FRAGCOUNTING = false;
+
 // Some compile-time template specializations here because for perf reasons, 
 // we need each variation of getVertex to be a separately compiled function.
 // Branching at runtime may increase rendering duration by a couple of percent.
@@ -289,6 +291,9 @@ void rasterize(
 							sh_mesh.cummulativeTriangleCount + triangleIndex + instanceIndex * sh_mesh.numTriangles
 						);
 						atomicMin(&args.target.framebuffer[pixelID], pixel);
+						if constexpr (ENABLE_FRAGCOUNTING){
+							atomicAdd(&args.state->dbg_fragcount, 1);
+						}
 					}
 				}
 
@@ -332,6 +337,7 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 		sh_blockLocalBatchIndex = 0;
 		sh_meshIndex = 0;
 		sh_mesh = args.meshes[0];
+		args.state->dbg_fragcount = 0;
 	}
 
 	grid.sync();
@@ -592,6 +598,17 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 
 					uint64_t pixel = pack_pixel(depth, packed_id);
 					atomicMin(&args.target.framebuffer[pixelID], pixel);
+
+					if constexpr (ENABLE_FRAGCOUNTING){
+						atomicAdd(&args.state->dbg_fragcount, 1);
+					}
+
+					// if(px == args.target.width){
+					// 	args.target.colorbuffer[pixelID] = 0x00000000'ff0000ff;
+					// }
+					// if(px < 0){
+					// 	args.target.colorbuffer[pixelID] = 0x00000000'ff00ffff;
+					// }
 				}
 			}
 		}
@@ -710,6 +727,9 @@ void stage3_drawHugeTriangles(RasterArgs args){
 					uint64_t pixel = pack_pixel(depth, mesh.cummulativeTriangleCount + tri.triangleIndex);
 
 					atomicMin(&args.target.framebuffer[pixelID], pixel);
+					if constexpr (ENABLE_FRAGCOUNTING){
+						atomicAdd(&args.state->dbg_fragcount, 1);
+					}
 				}
 			}
 		}
@@ -773,6 +793,9 @@ void stage3_drawHugeTriangles(RasterArgs args){
 			uint64_t pixel = pack_pixel(depth, mesh.cummulativeTriangleCount + tri.triangleIndex);
 
 			atomicMin(&args.target.framebuffer[pixelID], pixel);
+			if constexpr (ENABLE_FRAGCOUNTING){
+				atomicAdd(&args.state->dbg_fragcount, 1);
+			}
 
 		}
 

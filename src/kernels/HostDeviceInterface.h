@@ -127,6 +127,7 @@ struct DeviceState{
 	uint32_t dbg_hovered_mcu_y;
 	uint32_t dbg_hovered_mcu;
 	uint32_t dbg_hovered_decoded_color;
+	uint64_t dbg_fragcount;
 };
 
 struct RenderTarget{
@@ -321,6 +322,7 @@ struct RasterArgs{
 	uint32_t* nontrivialTrianglesCounter;
 	uint64_t* nontrivialTrianglesList;
 	RenderTarget target;
+	DeviceState* state;
 };
 
 extern __constant__ RenderTarget c_target;
