@@ -294,7 +294,7 @@ void initScene() {
 	// loadXyzDragon();
 	// loadSpot();
 	// loadWietrznia();
-	loadSponza();
+	// loadSponza();
 	// loadSponzaJPEG();
 	// loadCubeJpeg();
 	// loadPolygraphenewerkLeibzigInstances();
