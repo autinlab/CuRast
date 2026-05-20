@@ -1,11 +1,13 @@
 
 #include <unordered_set>
 #include <execution>
+
 #include "jpeg/JpegTextures.h"
 
 #include "Timer.h"
 #include "VKRenderer.h"
 #include "TextureManager.h"
+#include "types.h"
 
 using namespace std;
 
@@ -26,8 +28,8 @@ static unordered_map<int64_t, int64_t> lastImportedVersion;
 void launch_drawBoundingBoxes(
 	RenderTarget target,
 	CMesh* meshes,
-	uint32_t numMeshes,
-	uint32_t* numProcessedBatches
+	u32 numMeshes,
+	u32* numProcessedBatches
 );
 
 MappedTextures mapCudaVk(vector<shared_ptr<VKTexture>> textures){
@@ -50,10 +52,10 @@ void unmapCudaVk(MappedTextures& mappings){
 
 void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebuffer, CudaModularProgram* prog_resolve){
 
-	uint64_t numPixels = target.width * target.height;
+	u64 numPixels = target.width * target.height;
 	CUdeviceptr cptr_screenshot = MemoryManager::alloc(numPixels * 4, "screenshot");
 
-	uint32_t backgroundColor = 0;
+	u32 backgroundColor = 0;
 	uint8_t* bgRgba = (uint8_t*)&backgroundColor;
 	bgRgba[0] = clamp(CuRastSettings::background.x * 256.0f, 0.0f, 255.0f);
 	bgRgba[1] = clamp(CuRastSettings::background.y * 256.0f, 0.0f, 255.0f);
@@ -135,13 +137,13 @@ void drawTrianglesVisbuffer(
 	args.instances                       = (CMesh*)cptr_instances;
 	args.numInstances                    = instances.size();
 	args.transforms                      = (mat4*)cptr_transforms;
-	args.numProcessedBatches             = (uint32_t*)cptr_numProcessedBatches;
-	args.numProcessedBatches_nontrivial  = (uint32_t*)cptr_numProcessedBatches_nontrivial;
+	args.numProcessedBatches             = (u32*)cptr_numProcessedBatches;
+	args.numProcessedBatches_nontrivial  = (u32*)cptr_numProcessedBatches_nontrivial;
 	args.hugeTriangles                   = (HugeTriangle*)cptr_hugeTriangles;
-	args.hugeTrianglesCounter            = (uint32_t*)cptr_hugeTrianglesCounter;
-	args.numProcessedHugeTriangles       = (uint32_t*)cptr_numProcessedHugeTriangles;
-	args.nontrivialTrianglesCounter      = (uint32_t*)cptr_nontrivialCounter;
-	args.nontrivialTrianglesList         = (uint64_t*)cptr_nontrivialList;
+	args.hugeTrianglesCounter            = (u32*)cptr_hugeTrianglesCounter;
+	args.numProcessedHugeTriangles       = (u32*)cptr_numProcessedHugeTriangles;
+	args.nontrivialTrianglesCounter      = (u32*)cptr_nontrivialCounter;
+	args.nontrivialTrianglesList         = (u64*)cptr_nontrivialList;
 	args.target                          = target;
 	args.state                           = (DeviceState*)CuRast::instance->cptr_state;
 	
@@ -151,6 +153,82 @@ void drawTrianglesVisbuffer(
 
 	auto cuend = Timer::recordCudaTimestamp();
 	Timer::recordDuration("<triangles visbuffer pipeline>", custart, cuend);
+}
+
+void cubSortUint64Keys(uint64_t* d_keys_in, uint64_t* d_keys_out, int num_items);
+
+void drawTrianglesTranslucent(
+	Scene* scene, View view, vector<CMesh>& meshes,
+	vector<CMesh>& instances, CUdeviceptr cptr_meshes,
+	CUdeviceptr cptr_instances, CUdeviceptr cptr_transforms, 
+	CUdeviceptr cptr_triangleCountPrefixsum,
+	RenderTarget& target, MappedTextures& mappings
+){
+	auto editor = CuRast::instance;
+
+	static CUdeviceptr cptr_numProcessedBatches             = MemoryManager::alloc(4, "cptr_numProcessedBatches");
+	static CUdeviceptr cptr_numProcessedBatches_nontrivial  = MemoryManager::alloc(4, "cptr_numProcessedBatches_nontrivial");
+	static CUdeviceptr cptr_hugeTriangles                   = MemoryManager::alloc(MAX_HUGE_TRIANGLES * sizeof(HugeTriangle), "cptr_hugeTriangles");
+	static CUdeviceptr cptr_hugeTrianglesCounter            = MemoryManager::alloc(4, "cptr_hugeTrianglesCounter");
+	static CUdeviceptr cptr_nontrivialCounter               = MemoryManager::alloc(4, "cptr_nontrivialCounter");
+	static CUdeviceptr cptr_nontrivialList                  = MemoryManager::alloc(8 * MAX_NONTRIVIAL_TRIANGLES, "cptr_nontrivialList");
+	static CUdeviceptr cptr_numProcessedHugeTriangles       = MemoryManager::alloc(4, "cptr_numProcessedHugeTriangles");
+	
+	static CUdeviceptr cptr_queueTriangles                  = MemoryManager::alloc(MAX_TRANSLUCENT_TRIANGLES * sizeof(TranslucentTriangle), "cptr_queue");
+	static CUdeviceptr cptr_queueKeyValue                   = MemoryManager::alloc(MAX_TRANSLUCENT_TRIANGLES * sizeof(uint64_t), "cptr_queueKeyValue");
+	static CUdeviceptr cptr_queueKeyValueSorted             = MemoryManager::alloc(MAX_TRANSLUCENT_TRIANGLES * sizeof(uint64_t), "cptr_queueKeyValueSorted");
+	static CUdeviceptr cptr_queueSize                       = MemoryManager::alloc(4, "cptr_queueSize");
+	
+	static CudaModularProgram* prog = new CudaModularProgram({
+		.modules = {"./src/kernels/triangles_translucent.cu",}
+	});
+
+	if(instances.size() == 0) return;
+
+	RasterArgs args;
+	args.meshes                          = (CMesh*)cptr_meshes;
+	args.numMeshes                       = meshes.size(); 
+	args.instances                       = (CMesh*)cptr_instances;
+	args.numInstances                    = instances.size();
+	args.transforms                      = (mat4*)cptr_transforms;
+	args.numProcessedBatches             = (u32*)cptr_numProcessedBatches;
+	args.numProcessedBatches_nontrivial  = (u32*)cptr_numProcessedBatches_nontrivial;
+	args.hugeTriangles                   = (HugeTriangle*)cptr_hugeTriangles;
+	args.hugeTrianglesCounter            = (u32*)cptr_hugeTrianglesCounter;
+	args.numProcessedHugeTriangles       = (u32*)cptr_numProcessedHugeTriangles;
+	args.nontrivialTrianglesCounter      = (u32*)cptr_nontrivialCounter;
+	args.nontrivialTrianglesList         = (u64*)cptr_nontrivialList;
+	args.target                          = target;
+	args.state                           = (DeviceState*)CuRast::instance->cptr_state;
+	
+	// Stage 1: Binning
+	// Stage 2: Sorting
+	// Stage 3: Compute Tile Ranges
+	// Stage 3: Blending
+	
+	// string strKernelStage1 = format("kernel_binning", strCompressed, strInstanced);
+	// string strKernelStage2 = format("kernel_", strCompressed);
+	
+	auto custart = Timer::recordCudaTimestamp();
+	prog->launchCooperative("kernel_stage1_binning", vector<void*>{&args, &cptr_queueTriangles, &cptr_queueKeyValue, &cptr_queueSize}, {.blocksize = TRIANGLES_PER_SWEEP});
+	// prog->launchCooperative(strKernelStage2, vector<void*>{&args});
+	
+	// Stage 2: Sort - read queue size to host (syncs the stream), then CUB-sort on GPU
+	u32 queueSize = 0;
+	cuMemcpyDtoH(&queueSize, cptr_queueSize, 4);
+	if (queueSize > 0) {
+		cubSortUint64Keys(
+			reinterpret_cast<uint64_t*>(cptr_queueKeyValue),
+			reinterpret_cast<uint64_t*>(cptr_queueKeyValueSorted),
+			static_cast<int>(queueSize)
+		);
+	}
+
+	auto cuend = Timer::recordCudaTimestamp();
+	Timer::recordDuration("<triangles translucent pipeline>", custart, cuend);
+	
+	auto& dvlist = Runtime::debugValueList;
+	dvlist.push_back({"num tiles", format("{:L}", queueSize)});
 }
 
 void CuRast::draw(Scene* scene, vector<View> views){
@@ -169,8 +247,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 	int supersamplingFactor = CuRastSettings::supersamplingFactor;
 
 	RenderTarget target;
-	target.framebuffer = (uint64_t*)cvm_framebuffer->cptr;
-	target.colorbuffer = (uint64_t*)cvm_colorbuffer->cptr;
+	target.framebuffer = (u64*)cvm_framebuffer->cptr;
+	target.colorbuffer = (u64*)cvm_colorbuffer->cptr;
 	target.width = supersamplingFactor * view.framebuffer->width;
 	target.height = supersamplingFactor * view.framebuffer->height;
 	target.view = view.view;
@@ -204,10 +282,10 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		node->update(view);
 	});
 
-	uint64_t numTotalTriangles = 0;
-	uint64_t numTotalNodes = 0;
-	uint64_t numVisibleTriangles = 0;
-	uint64_t numVisibleNodes = 0;
+	u64 numTotalTriangles = 0;
+	u64 numTotalNodes = 0;
+	u64 numVisibleTriangles = 0;
+	u64 numVisibleNodes = 0;
 	for(int64_t i = 0; i < nodes.size(); i++){
 		SNTriangles* node = nodes[i];
 
@@ -228,7 +306,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 	sort(std::execution::par, nodes.begin(), nodes.end(), [](SNTriangles* a, SNTriangles* b){
 
 		if(a->mesh->numTriangles == b->mesh->numTriangles){
-			return uint64_t(a->mesh) < uint64_t(b->mesh);
+			return u64(a->mesh) < u64(b->mesh);
 		}else{
 			return a->mesh->numTriangles > b->mesh->numTriangles;
 		}
@@ -245,16 +323,16 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 		auto toCMesh = [&](SNTriangles* node){
 
-			uint32_t indexRange = node->mesh->index_max - node->mesh->index_min;
-			uint64_t bitsPerIndex = ceil(log2f(float(indexRange + 1)));
+			u32 indexRange = node->mesh->index_max - node->mesh->index_min;
+			u64 bitsPerIndex = ceil(log2f(float(indexRange + 1)));
 
 			CMesh mesh;
 			mesh.world                    = node->transform_global;
 			mesh.positions                = (vec3*)node->mesh->cptr_position;
 			mesh.uvs                      = (vec2*)node->mesh->cptr_uv;
-			mesh.colors                   = (uint32_t*)node->mesh->cptr_color;
+			mesh.colors                   = (u32*)node->mesh->cptr_color;
 			mesh.normals                  = (vec3*)node->mesh->cptr_normal;
-			mesh.indices                  = (uint32_t*)node->mesh->cptr_indices;
+			mesh.indices                  = (u32*)node->mesh->cptr_indices;
 			mesh.index_min                = node->mesh->index_min;
 			mesh.index_max                = node->mesh->index_max;
 			mesh.bitsPerIndex             = bitsPerIndex;
@@ -268,7 +346,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			mesh.compressionFactor        = (node->aabb.max - node->aabb.min) / 65536.0f;
 			mesh.isLoaded                 = node->mesh->isLoaded;
 			mesh.id                       = node->id;
-			mesh.address                  = uint64_t(node->mesh);
+			mesh.address                  = u64(node->mesh);
 
 			vec3 c0 = node->transform_global[0];
 			vec3 c1 = node->transform_global[1];
@@ -285,7 +363,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		static vector<CMesh> meshes_unique;
 		static vector<CMesh> meshes_allInstances;
 		static vector<mat4> transforms;
-		static vector<uint64_t> triangleCountPrefixsum;
+		static vector<u64> triangleCountPrefixsum;
 		int64_t sum = 0;
 		
 		meshes_unique.resize(nodes.size());
@@ -300,16 +378,14 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		});
 
 		CMesh* uniqueMesh = nullptr;
-		uint64_t uniqueMeshCounter = 0;
+		u64 uniqueMeshCounter = 0;
 		for(int i = 0; i < nodes.size(); i++){
 			CMesh& cmesh = meshes_allInstances[i];
 
 			cmesh.cummulativeTriangleCount = sum;
 			cmesh.instances.offset = i;
-			// meshes_allInstances[i].instances.count = 1; // should only matter for the unique meshes entries
 
 			triangleCountPrefixsum[i] = sum;
-
 			sum += cmesh.numTriangles;
 
 			// Encountered a new unique mesh
@@ -323,24 +399,46 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			uniqueMesh->instances.count++;
 		}
 		meshes_unique.resize(uniqueMeshCounter);
+		
+		// Group into opaque and translucent meshes to render each with the corresponding cuda kernels
+		static vector<CMesh> meshes_unique_opaque;
+		static vector<CMesh> meshes_unique_translucent;
+		meshes_unique_opaque.resize(0);
+		meshes_unique_translucent.resize(0);
+		
+		for(CMesh mesh : meshes_unique){
+			bool isTranslucent = mesh.texture.isTranslucent;
+			
+			if(isTranslucent){
+				meshes_unique_translucent.push_back(mesh);
+			}else{
+				meshes_unique_opaque.push_back(mesh);
+			}
+		}
 
 		// prep virtual memory for lots of nodes
 		static CudaVirtualMemory* cvm_meshes                    = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_meshes");
+		static CudaVirtualMemory* cvm_meshes_opaque             = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_meshes_opaque");
+		static CudaVirtualMemory* cvm_meshes_translucent        = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_meshes_translucent");
 		static CudaVirtualMemory* cvm_instances                 = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_instances");
 		static CudaVirtualMemory* cvm_transforms                = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(mat4), "cvm_transforms");
-		static CudaVirtualMemory* cvm_triangleCountPrefixsum    = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(uint64_t), "cvm_triangleCountPrefixsum");
+		static CudaVirtualMemory* cvm_triangleCountPrefixsum    = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(u64), "cvm_triangleCountPrefixsum");
 		
 		// commit physical memory for actual amount of nodes
-		cvm_meshes                 ->commit(meshes_unique.size()          * sizeof(CMesh));
-		cvm_instances              ->commit(meshes_allInstances.size()    * sizeof(CMesh));
-		cvm_transforms             ->commit(transforms.size()             * sizeof(mat4));
-		cvm_triangleCountPrefixsum ->commit(triangleCountPrefixsum.size() * sizeof(uint64_t));
+		cvm_meshes                 ->commit(meshes_unique.size()             * sizeof(CMesh));
+		cvm_meshes_opaque          ->commit(meshes_unique_opaque.size()      * sizeof(CMesh));
+		cvm_meshes_translucent     ->commit(meshes_unique_translucent.size() * sizeof(CMesh));
+		cvm_instances              ->commit(meshes_allInstances.size()       * sizeof(CMesh));
+		cvm_transforms             ->commit(transforms.size()                * sizeof(mat4));
+		cvm_triangleCountPrefixsum ->commit(triangleCountPrefixsum.size()    * sizeof(u64));
 
 		// submit per-frame geometry metadata to GPU
-		cuMemcpyHtoDAsync(cvm_meshes->cptr                 , meshes_unique.data(),          byteSizeOf(meshes_unique), 0);
-		cuMemcpyHtoDAsync(cvm_instances->cptr              , meshes_allInstances.data(),    byteSizeOf(meshes_allInstances), 0);
-		cuMemcpyHtoDAsync(cvm_transforms->cptr             , transforms.data(),             byteSizeOf(transforms), 0);
-		cuMemcpyHtoDAsync(cvm_triangleCountPrefixsum->cptr , triangleCountPrefixsum.data(), byteSizeOf(triangleCountPrefixsum), 0);
+		cuMemcpyHtoDAsync(cvm_meshes->cptr                 , meshes_unique.data(),             byteSizeOf(meshes_unique), 0);
+		cuMemcpyHtoDAsync(cvm_meshes_opaque->cptr          , meshes_unique_opaque.data(),      byteSizeOf(meshes_unique_opaque), 0);
+		cuMemcpyHtoDAsync(cvm_meshes_translucent->cptr     , meshes_unique_translucent.data(), byteSizeOf(meshes_unique_translucent), 0);
+		cuMemcpyHtoDAsync(cvm_instances->cptr              , meshes_allInstances.data(),       byteSizeOf(meshes_allInstances), 0);
+		cuMemcpyHtoDAsync(cvm_transforms->cptr             , transforms.data(),                byteSizeOf(transforms), 0);
+		cuMemcpyHtoDAsync(cvm_triangleCountPrefixsum->cptr , triangleCountPrefixsum.data(),    byteSizeOf(triangleCountPrefixsum), 0);
 
 		Runtime::numVisibleNodes = numVisibleNodes;
 		Runtime::numVisibleTriangles = numVisibleTriangles;
@@ -348,10 +446,10 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		Runtime::numTriangles = numTotalTriangles;
 
 		auto& dvlist = Runtime::debugValueList;
-		dvlist.push_back({"#total nodes           ", format("{:40L}", uint64_t(numTotalNodes))});
-		dvlist.push_back({"#total triangles       ", format("{:40L}", uint64_t(numTotalTriangles))});
-		dvlist.push_back({"#visible nodes         ", format("{:40L}", uint64_t(numVisibleNodes))});
-		dvlist.push_back({"#visible triangles     ", format("{:40L}", uint64_t(numVisibleTriangles))});
+		dvlist.push_back({"#total nodes           ", format("{:40L}", u64(numTotalNodes))});
+		dvlist.push_back({"#total triangles       ", format("{:40L}", u64(numTotalTriangles))});
+		dvlist.push_back({"#visible nodes         ", format("{:40L}", u64(numVisibleNodes))});
+		dvlist.push_back({"#visible triangles     ", format("{:40L}", u64(numVisibleTriangles))});
 		dvlist.push_back({"hovered mesh id        ", format("{:40L}", CuRast::deviceState->hovered_meshId)});
 		dvlist.push_back({"hovered triangle index ", format("{:40L}", CuRast::deviceState->hovered_triangleIndex)});
 		dvlist.push_back({"hovered node name      ", format("{:}", Runtime::hovered_node_name)});
@@ -379,10 +477,10 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		prog->launch("kernel_dummy", {&dummydata}, 1);
 		
 		{ // resize and clear cuda framebuffer
-			uint32_t clearColor = 0xff000000;
+			u32 clearColor = 0xff000000;
 			float clearDepth = Infinity;
 
-			uint64_t requiredBytes = numPixels * 8;
+			u64 requiredBytes = numPixels * 8;
 			cvm_framebuffer->commit(requiredBytes);
 			cvm_colorbuffer->commit(requiredBytes);
 
@@ -402,17 +500,16 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		}
 
 		drawTrianglesVisbuffer(
-			scene, view, meshes_unique, meshes_allInstances, 
-			cvm_meshes->cptr, 
+			scene, view, meshes_unique_opaque, meshes_allInstances, 
+			cvm_meshes_opaque->cptr, 
 			cvm_instances->cptr, cvm_transforms->cptr, cvm_triangleCountPrefixsum->cptr,
 			target, mappings
 		);
-		
 
 		// DRAW BOUNDING BOXES
 		if(CuRastSettings::showBoundingBoxes){
 			RenderTarget target_lines = target;
-			target_lines.framebuffer = (uint64_t*)cvm_colorbuffer->cptr;
+			target_lines.framebuffer = (u64*)cvm_colorbuffer->cptr;
 
 			vector<CMesh> boundingBoxNodes;
 			scene->forEach<SNTriangles>([&](SNTriangles* node){
@@ -431,18 +528,18 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			cuMemcpyHtoDAsync(cvm_meshes_boxes->cptr, boundingBoxNodes.data(), boundingBoxNodes.size() * sizeof(CMesh), 0);
 			cuMemsetD8Async(cptr_numProcessedBatches, 0, 4, 0);
 			
-			uint32_t numMeshes = boundingBoxNodes.size();
+			u32 numMeshes = boundingBoxNodes.size();
 			launch_drawBoundingBoxes(
 				target_lines, 
 				(CMesh*)cvm_meshes_boxes->cptr,
 				numMeshes,
-				(uint32_t*)cptr_numProcessedBatches
+				(u32*)cptr_numProcessedBatches
 			);
 		}
 
 		int mouse_X = Runtime::mousePosition.x;
 		int mouse_Y = target.height - Runtime::mousePosition.y;
-		uint32_t numInstances = meshes_allInstances.size();
+		u32 numInstances = meshes_allInstances.size();
 
 		RasterizationSettings rasterSettings;
 		rasterSettings.showWireframe = CuRastSettings::showWireframe;
@@ -451,11 +548,11 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		rasterSettings.enableObjectPicking = CuRastSettings::enableObjectPicking;
 
 		JpegPipeline jpp;
-		jpp.toDecode             = (uint32_t*)jpegTextures->cptr_toDecode;
-		jpp.toDecodeCounter      = (uint32_t*)jpegTextures->cptr_toDecodeCounter;
-		jpp.decoded              = (uint32_t*)jpegTextures->cptr_decoded;
-		jpp.TBSlots              = (uint32_t*)jpegTextures->cptr_TBSlots;
-		jpp.TBSlotsCounter       = (uint32_t*)jpegTextures->cptr_TBSlotsCounter;
+		jpp.toDecode             = (u32*)jpegTextures->cptr_toDecode;
+		jpp.toDecodeCounter      = (u32*)jpegTextures->cptr_toDecodeCounter;
+		jpp.decoded              = (u32*)jpegTextures->cptr_decoded;
+		jpp.TBSlots              = (u32*)jpegTextures->cptr_TBSlots;
+		jpp.TBSlotsCounter       = (u32*)jpegTextures->cptr_TBSlotsCounter;
 		jpp.decodedMcuMap        = *jpegTextures->decodedMcuMap;
 		
 		static CUdeviceptr cptr_textures = MemoryManager::alloc(MAX_TEXTURES * sizeof(Texture), "texture list");
@@ -480,9 +577,16 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			};
 			prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D", args, target.width, target.height);
 		}
+		
+		drawTrianglesTranslucent(
+			scene, view, meshes_unique_translucent, meshes_allInstances, 
+			cvm_meshes_translucent->cptr, 
+			cvm_instances->cptr, cvm_transforms->cptr, cvm_triangleCountPrefixsum->cptr,
+			target, mappings
+		);
 
 		if(hasJpegCompressedTextures){
-			uint32_t toDecodeCounter;
+			u32 toDecodeCounter;
 			cuMemcpyDtoH(&toDecodeCounter, (CUdeviceptr)jpp.toDecodeCounter, 4);
 			dvlist.push_back({"toDecodeCounter ", format("{}", toDecodeCounter)});
 
@@ -515,7 +619,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			}
 
 			{// DEBUG
-				uint32_t C = CuRast::deviceState->dbg_hovered_decoded_color;
+				u32 C = CuRast::deviceState->dbg_hovered_decoded_color;
 				uint8_t* rgba = (uint8_t*)&C;
 				string strColor = format("{:3}, {:3}, {:3}", rgba[0], rgba[1], rgba[2]);
 
@@ -546,7 +650,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			// 	// Disable caching by fully clearing the MCU slot list and hash map at the end of each frame.
 			// 	// This let's us see how much slower the decode kernel becomes.
 			// 	cuMemsetD8((CUdeviceptr)jpegTextures->decodedMcuMap->entries, 0xff, jpegTextures->decodedMcuMap->capacity * 8);
-			// 	uint32_t capacity = JPEG_NUM_DECODED_MCU_CAPACITY;
+			// 	u32 capacity = JPEG_NUM_DECODED_MCU_CAPACITY;
 			// 	jpegTextures->prog->launch("kernel_init_availableMcuSlots", {
 			// 		&jpegTextures->cptr_TBSlots, 
 			// 		&jpegTextures->cptr_TBSlotsCounter, 
@@ -625,7 +729,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			int viewWidth = view.framebuffer->width;
 			int viewHeight = view.framebuffer->height;
 
-			uint32_t backgroundColor = 0;
+			u32 backgroundColor = 0;
 			uint8_t* bgRgba = (uint8_t*)&backgroundColor;
 			bgRgba[0] = clamp(CuRastSettings::background.x * 256.0f, 0.0f, 255.0f);
 			bgRgba[1] = clamp(CuRastSettings::background.y * 256.0f, 0.0f, 255.0f);
