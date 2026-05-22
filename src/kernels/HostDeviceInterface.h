@@ -269,6 +269,7 @@ struct TranslucentTriangle{
 };
 
 constexpr int TILE_SIZE = 64;
+constexpr int TILE_SIZE_TRANSLUCENT = 16;
 constexpr uint32_t TRIANGLES_PER_SWEEP = 256;
 constexpr uint32_t MAX_HUGE_TRIANGLES = 5'000'000;
 constexpr uint32_t MAX_TRANSLUCENT_TRIANGLES = 5'000'000;

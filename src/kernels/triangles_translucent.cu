@@ -30,6 +30,8 @@ using glm::ivec2;
 using glm::i8vec4;
 using glm::vec4;
 
+
+
 vec4 getVertex(const CMesh& mesh, u32 vertexIndex){
 
 	u32 resolvedIndex;
@@ -44,6 +46,133 @@ vec4 getVertex(const CMesh& mesh, u32 vertexIndex){
 	return pos;
 }
 
+vec2 getUV(const CMesh& mesh, u32 vertexIndex){
+
+	u32 resolvedIndex;
+	if(mesh.indices){
+		resolvedIndex = mesh.indices[vertexIndex];
+	}else{
+		resolvedIndex = vertexIndex;
+	}
+
+	vec2 uv = mesh.uvs[resolvedIndex];
+	
+	return uv;
+}
+
+__device__
+uint32_t sampleColor_nearest(
+	uint32_t* textureData,
+	int width,
+	int height,
+	vec2 uv
+){
+
+	if(textureData == nullptr) return 0;
+	// return 0xff660066;
+	uv.x = uv.x - floor(uv.x);
+	uv.y = uv.y - floor(uv.y);
+	int tx = int(uv.x * float(width) + 0.5f) % width;
+	int ty = int(uv.y * float(height) + 0.5f) % height;
+	int texelID = tx + ty * width;
+	texelID = clamp(texelID, 0, width * height - 1);
+
+	uint32_t color = 0;
+	color = textureData[texelID];
+	//uint8_t *rgb = (uint8_t *)&color;
+
+	return color;
+}
+
+__device__
+uint32_t sampleColor_linear(
+	uint32_t* textureData,
+	int width,
+	int height,
+	vec2 uv
+){
+
+	if(textureData == nullptr) return 0;
+
+	uint32_t color = 0xff000000;
+	uint8_t* rgba = (uint8_t*)&color;
+
+	// Only for ply with textures
+	// if(uv.x > 1.0f) return 0;
+	// if(uv.y > 1.0f) return 0;
+	// uv.y = 1.0f - uv.y;
+
+	float ftx = (uv.x - floor(uv.x)) * float(width);
+	float fty = (uv.y - floor(uv.y)) * float(height);
+
+	auto getTexel = [&](float ftx, float fty) -> vec4 {
+		int tx = fmodf(ftx, float(width));
+		int ty = fmodf(fty, float(height));
+		int texelID = tx + ty * width;
+		texelID = clamp(texelID, 0, width * height - 1);
+
+		uint32_t texel = textureData[texelID];
+		uint8_t* rgba = (uint8_t*)&texel;
+
+		return vec4{rgba[0], rgba[1], rgba[2], rgba[3]};
+	};
+
+	vec4 t00 = getTexel(ftx - 0.5f, fty - 0.5f);
+	vec4 t01 = getTexel(ftx - 0.5f, fty + 0.5f);
+	vec4 t10 = getTexel(ftx + 0.5f, fty - 0.5f);
+	vec4 t11 = getTexel(ftx + 0.5f, fty + 0.5f);
+
+	float wx = fmodf(ftx + 0.5f, 1.0f);
+	float wy = fmodf(fty + 0.5f, 1.0f);
+
+	vec4 interpolated =
+		(1.0f - wx) * (1.0f - wy) * t00 +
+		wx * (1.0f - wy) * t10 +
+		(1.0f - wx) * wy * t01 +
+		wx * wy * t11;
+
+	rgba[0] = interpolated.r;
+	rgba[1] = interpolated.g;
+	rgba[2] = interpolated.b;
+	rgba[3] = interpolated.a;
+
+
+	return color;
+}
+
+// Used to sort queued translucent triangles by tile and depth.
+// attributes: <tile><depth><queueIndex>
+// tile_x: 8 bit
+// tile_y: 8 bit
+// depth: 24 bit
+// triangle part index: 24 bit
+u64 encodeTranslucentKeyValue(int tile_x, int tile_y, float depth, int queueIndex){
+	
+	u32 udepth = __float_as_uint(depth) & 0xffffff00;
+	
+	u64 keyValue = 
+			u64(tile_y) << 56 |
+			u64(tile_x) << 48 |
+			u64(udepth) << 16 |
+			u64(queueIndex);
+			
+	return keyValue;
+}
+
+void decodeTranslucentKeyValue(
+	u64 keyValue, 
+	int& tile_x, 
+	int& tile_y, 
+	float& depth,
+	int& queueIndex
+){
+	tile_y = (keyValue >> 56) & 0xff;
+	tile_x = (keyValue >> 48) & 0xff;
+	u32 udepth = (keyValue >> 24) & 0xffffff00;
+	depth = __uint_as_float(udepth);
+	queueIndex = (keyValue >> 0) & 0xffffff;
+}
+
 void binning(
 	const RasterArgs args,
 	const CMesh& sh_mesh,
@@ -55,14 +184,14 @@ void binning(
 	vec4 b_object,
 	vec4 c_object,
 	TranslucentTriangle* queueTriangles,
-	uint64_t* queueKeyValues,
+	u64* queueKeyValues,
 	u32* queueSize
 ){
 	
 	if(triangleIndex >= sh_mesh.numTriangles) return;
 	
 	// if(meshIndex != 0) return;
-	// if(triangleIndex != 0) return;
+	// if(triangleIndex > 1) return;
 	
 	float f = args.target.proj[1][1];
 	float aspect = float(args.target.width) / float(args.target.height);
@@ -90,26 +219,24 @@ void binning(
 	if(min_x >= max_x) return;
 	if(min_y >= max_y) return;
 	
-	auto drawLine = [&](vec2 start, vec2 end){
-		for(float i = 0; i <= 200; i++){
-			float u = float(i) / 200.0f;
+	// auto drawLine = [&](vec2 start, vec2 end){
+	// 	for(float i = 0; i <= 200; i++){
+	// 		float u = float(i) / 200.0f;
 			
-			vec2 pos = (1.0f - u) * start + u * end;
+	// 		vec2 pos = (1.0f - u) * start + u * end;
 			
-			int px = pos.x;
-			int py = pos.y;
+	// 		int px = pos.x;
+	// 		int py = pos.y;
 			
-			if(px < 0 || px >= args.target.width) continue;
-			if(py < 0 || py >= args.target.height) continue;
+	// 		if(px < 0 || px >= args.target.width) continue;
+	// 		if(py < 0 || py >= args.target.height) continue;
 			
-			int pixelID = px + args.target.width * py;
+	// 		int pixelID = px + args.target.width * py;
 			
-			u64 pixel = 0x00000000'ff0000ff;
-			atomicMin(&args.target.colorbuffer[pixelID], pixel);
-			
-			
-		}
-	};
+	// 		u64 pixel = 0x00000000'ff0000ff;
+	// 		atomicMin(&args.target.colorbuffer[pixelID], pixel);
+	// 	}
+	// };
 	
 	// drawLine({min_x, min_y}, {max_x, min_y});
 	// drawLine({min_x, max_y}, {max_x, max_y});
@@ -118,17 +245,20 @@ void binning(
 	
 	// printf("%.3f, %.3f \n", min_x, max_x);
 	
-	constexpr int TILE_SIZE = 16;
 	
-	int size_x = max_x - min_x;
-	int size_y = max_y - min_y;
-	int tiles_x = (size_x + TILE_SIZE - 1) / TILE_SIZE;
-	int tiles_y = (size_y + TILE_SIZE - 1) / TILE_SIZE;
+	// int size_x = max_x - min_x;
+	// int size_y = max_y - min_y;
+	int tiles_x = int(max_x / 16) - int(min_x / 16) + 1;
+	int tiles_y = int(max_y / 16) - int(min_y / 16) + 1;
+	// int tiles_x = (size_x + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
+	// int tiles_y = (size_y + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
 	int numTiles = tiles_x * tiles_y;
+	
+	// printf("%d %d\n", min_x, max_x);
 	
 	if(numTiles == 0) return;
 	
-	u32 queueIndex = atomicAdd(queueSize, numTiles);
+	u32 queueIndexStart = atomicAdd(queueSize, numTiles);
 	
 	for(int i = 0; i < numTiles; i++){
 		int lx = i % tiles_x;
@@ -136,28 +266,15 @@ void binning(
 		
 		TranslucentTriangle t;
 		t.meshIndex = meshIndex;
-		t.tile_x = int(min_x) / TILE_SIZE + lx;
-		t.tile_y = int(min_y) / TILE_SIZE + ly;
+		t.tile_x = int(min_x) / TILE_SIZE_TRANSLUCENT + lx;
+		t.tile_y = int(min_y) / TILE_SIZE_TRANSLUCENT + ly;
 		t.triangleIndex = triangleIndex;
 		
 		float depth = a_ndc.z;
-		uint32_t udepth = __float_as_uint(depth) & 0xffffff00;
-		
-		// Used to sort queued translucent triangles by tile and depth.
-		// attributes: <tile><depth><queueIndex>
-		// tile_x: 8 bit
-		// tile_y: 8 bit
-		// depth: 24 bit
-		// triangle part index: 24 bit
-		uint64_t keyValue = 
-			uint64_t(t.tile_x) << 56 ||
-			uint64_t(t.tile_y) << 48 ||
-			uint64_t(t.tile_y) << 48 ||
-			uint64_t(udepth)   << 24 ||
-			uint64_t(queueIndex + i);
+		u64 keyValue = encodeTranslucentKeyValue(t.tile_x, t.tile_y, depth, queueIndexStart + i);
 			
-		queueTriangles[queueIndex + i] = t;
-		queueKeyValues[queueIndex + i] = keyValue;
+		queueTriangles[queueIndexStart + i] = t;
+		queueKeyValues[queueIndexStart + i] = keyValue;
 	}
 	
 	
@@ -169,7 +286,7 @@ extern "C" __global__
 void kernel_stage1_binning(
 	RasterArgs args,
 	TranslucentTriangle* queueTriangles,
-	uint64_t* queueKeyValues,
+	u64* queueKeyValues,
 	u32* queueSize
 ){
 	auto grid = cg::this_grid();
@@ -253,4 +370,311 @@ void kernel_stage1_binning(
 		}
 	}
 
+}
+
+
+extern "C" __global__
+void kernel_stage3_computeRanges(
+	RasterArgs args,
+	TranslucentTriangle* queueTriangles,
+	u64* queueKeyValues,
+	u32* queueSize,
+	ivec2* tileRanges,
+	u32 numTiles
+){
+	auto grid = cg::this_grid();
+	auto block = cg::this_thread_block();
+	
+	u32 trianglePieceIndex = grid.thread_rank();
+	
+	if(trianglePieceIndex >= *queueSize) return;
+
+	
+	auto getTileID = [&](int trianglePieceIndex){
+		u64 triangleKeyValue = queueKeyValues[trianglePieceIndex];
+		u32 tiles_x = (args.target.width + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
+		
+		int tile_x, tile_y;
+		float depth;
+		int queueIndex;
+		decodeTranslucentKeyValue(triangleKeyValue, tile_x, tile_y, depth, queueIndex);
+		
+		if(trianglePieceIndex == 0){
+			// printf("dec: %d, %d \n", tile_x, tile_y);
+		}
+		
+		return tile_x + tiles_x * tile_y;
+	};
+	
+	if(grid.thread_rank() == 0){
+		
+		// printf("==== \n");
+		for(int i = 0; i < *queueSize; i++){
+			
+			u64 triangleKeyValue = queueKeyValues[i];
+			u32 tiles_x = (args.target.width + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
+			
+			int tile_x, tile_y;
+			float depth;
+			int queueIndex;
+			decodeTranslucentKeyValue(triangleKeyValue, tile_x, tile_y, depth, queueIndex);
+			
+			// printf("%d, %d \n", tile_x, tile_y);
+		}
+	}
+	
+	u32 tileID = getTileID(trianglePieceIndex);
+	
+	if(trianglePieceIndex == 0){
+		ivec2 range = tileRanges[0];
+		
+		u64 triangleKeyValue = queueKeyValues[2];
+	}
+	
+	if(trianglePieceIndex == 0){
+		tileRanges[tileID].x = 0; // unnecessary?
+	}else{
+		u32 prevTileID = getTileID(trianglePieceIndex - 1);
+		
+		if(tileID != prevTileID){
+			// printf("    tileRanges[%d].y = %d\n", prevTileID, trianglePieceIndex - 1);
+			// printf("    tileRanges[%d].x = %d\n", tileID, trianglePieceIndex);
+			tileRanges[prevTileID].y = trianglePieceIndex;
+			tileRanges[tileID].x = trianglePieceIndex;
+		}
+	}
+	
+	if(trianglePieceIndex == *queueSize - 1){
+		tileRanges[tileID].y = *queueSize;
+	}
+}
+
+extern "C" __global__
+void kernel_stage4_blend(
+	RasterArgs args,
+	TranslucentTriangle* queueTriangles,
+	u64* queueKeyValues,
+	u32* queueSize,
+	ivec2* tileRanges,
+	u32 numTiles
+){
+	auto grid = cg::this_grid();
+	auto block = cg::this_thread_block();
+	
+	u32 tileID = grid.block_rank();
+	
+	u32 tiles_x = (args.target.width + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
+	u32 tiles_y = (args.target.height + TILE_SIZE_TRANSLUCENT - 1) / TILE_SIZE_TRANSLUCENT;
+	u32 tile_x = tileID % tiles_x;
+	u32 tile_y = tileID / tiles_x;
+	int lx = block.thread_rank() % TILE_SIZE_TRANSLUCENT; // local coordinate within tile
+	int ly = block.thread_rank() / TILE_SIZE_TRANSLUCENT;
+	int x = tile_x * TILE_SIZE_TRANSLUCENT + lx; // global framebuffer coordinate
+	int y = tile_y * TILE_SIZE_TRANSLUCENT + ly; // global framebuffer coordinate
+	int pixelID = toFramebufferIndex(x, y, args.target.width);
+	
+	if(tileID >= numTiles) return;
+	
+	float depth = Infinity;
+	vec4 rgba = {0.0f, 0.0f, 0.0f, 0.0f};
+	float remainingTranslucency = 1.0f;
+	
+	if(x > 0 && x < args.target.width)
+	if(y > 0 && y < args.target.height)
+	{
+		u64 currentPixel = args.target.colorbuffer[pixelID];
+		
+		depth = __uint_as_float(currentPixel >> 32);
+		u32 currentColor = currentPixel & 0xffffffff;
+		u8* currentRGBA = (u8*)&currentPixel;
+		
+		// rgba.x = float(currentRGBA[0]) / 256.0f;
+		// rgba.y = float(currentRGBA[1]) / 256.0f;
+		// rgba.z = float(currentRGBA[2]) / 256.0f;
+		// rgba.w = 0.0f;
+		
+	}
+	
+	float f = args.target.proj[1][1];
+	float aspect = float(args.target.width) / float(args.target.height);
+	float faI = 1.0f / (f / aspect);
+	float fI = 1.0f / f;
+	vec3 origin = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+	vec3 viewDir = vec4(0.0f, 0.0f, -1.0f, 0.0f);
+	
+	float u = 2.0f * (float(x) + 0.5f) / float(args.target.width) - 1.0f;
+	float v = 2.0f * (float(y) + 0.5f) / float(args.target.height) - 1.0f;
+
+	vec3 rayDir = normalize(vec3{
+		(1.0f / (f / aspect)) * u,
+		(1.0f / f) * v,
+		-1.0f
+	});
+	
+	ivec2 range = tileRanges[tileID];
+	u32 numPiecesInTile = range.y - range.x;
+	
+	auto drawLine = [&](vec2 start, vec2 end){
+		for(float i = 0; i <= 200; i++){
+			float u = float(i) / 200.0f;
+			
+			vec2 pos = (1.0f - u) * start + u * end;
+			
+			int px = pos.x;
+			int py = pos.y;
+			
+			if(px < 0 || px >= args.target.width) continue;
+			if(py < 0 || py >= args.target.height) continue;
+			
+			int pixelID = px + args.target.width * py;
+			
+			u64 pixel = 0x00000000'ff0000ff;
+			atomicMin(&args.target.colorbuffer[pixelID], pixel);
+		}
+	};
+	
+	if(numPiecesInTile == 0) return;
+	
+	// if(block.thread_rank() == 0){
+	// 	// printf("%d \n", tileID);
+		
+	// 	int min_x = TILE_SIZE_TRANSLUCENT * tile_x;
+	// 	int min_y = TILE_SIZE_TRANSLUCENT * tile_y;
+		
+	// 	drawLine({min_x, min_y}, {min_x + 16.0f, min_y + 0.0f});
+	// 	drawLine({min_x, min_y + 16.0f}, {min_x + 16.0f, min_y + 16.0f});
+	// 	drawLine({min_x, min_y}, {min_x, min_y + 16.0f});
+	// 	drawLine({min_x + 16.0f, min_y}, {min_x + 16.0f, min_y + 16.0f});
+	// }
+	
+	constexpr int PREFETCH_COUNT = 256;
+	int iterations = (numPiecesInTile + PREFETCH_COUNT - 1) / PREFETCH_COUNT;
+	
+	__shared__ TranslucentTriangle sh_triangles[PREFETCH_COUNT];
+	
+	for(int iteration = 0; iteration < iterations; iteration++){
+		
+		int index = PREFETCH_COUNT * iteration + block.thread_rank();
+		
+		// fetch triangles
+		if(index < numPiecesInTile && block.thread_rank() < PREFETCH_COUNT){
+			u64 keyValue = queueKeyValues[range.x + index];
+			
+			i32 tmp_tile_x, tmp_tile_y;
+			float tmp_depth;
+			int queueIndex;
+			decodeTranslucentKeyValue(keyValue, tmp_tile_x, tmp_tile_y, tmp_depth, queueIndex);
+			
+			sh_triangles[block.thread_rank()] = queueTriangles[queueIndex];
+		}
+		
+		block.sync();
+		
+		// blend triangles
+		int numTriangles = min(numPiecesInTile - PREFETCH_COUNT * iteration, PREFETCH_COUNT);
+		
+		for(int i = 0; i < numTriangles; i++){
+			TranslucentTriangle triangle = sh_triangles[i];
+			CMesh& mesh = args.meshes[triangle.meshIndex];
+			
+			mat4 worldView = args.transforms[mesh.instances.offset];
+			
+			vec4 a_object = getVertex(mesh, 3 * triangle.triangleIndex + 0);
+			vec4 b_object = getVertex(mesh, 3 * triangle.triangleIndex + 1);
+			vec4 c_object = getVertex(mesh, 3 * triangle.triangleIndex + 2);
+			vec3 a_view = worldView * a_object;
+			vec3 b_view = worldView * b_object;
+			vec3 c_view = worldView * c_object;
+			// vec3 a_ndc = viewToNDC(a_view, f, aspect);
+			// vec3 b_ndc = viewToNDC(b_view, f, aspect);
+			// vec3 c_ndc = viewToNDC(c_view, f, aspect);
+			// vec2 a_screen = ndcToScreen(a_ndc, args.target.width, args.target.height);
+			// vec2 b_screen = ndcToScreen(b_ndc, args.target.width, args.target.height);
+			// vec2 c_screen = ndcToScreen(c_ndc, args.target.width, args.target.height);
+			
+			vec2 a_uv = getUV(mesh, 3 * triangle.triangleIndex + 0);
+			vec2 b_uv = getUV(mesh, 3 * triangle.triangleIndex + 1);
+			vec2 c_uv = getUV(mesh, 3 * triangle.triangleIndex + 2);
+			
+			float bary_u, bary_v;
+			float t = intersectTriangle_mt(
+				origin, rayDir,
+				a_view, b_view, c_view,
+				false,
+				bary_u, bary_v
+			);
+
+			float bary_w = 1.0f - bary_u - bary_v;
+			vec2 uv = bary_w * a_uv + bary_u * b_uv + bary_v * c_uv;
+			
+			if(t == Infinity || pixelID >= args.target.width * args.target.height) {
+				continue;
+			}
+			
+			float t_view = t * (-rayDir.z);
+			if(t_view > depth) continue;
+			
+			
+
+			uint32_t triangleColor = sampleColor_linear(mesh.texture.data, mesh.texture.width, mesh.texture.height, uv);
+			u8* triangleRgba = (u8*)&triangleColor;
+
+			float src_r = triangleRgba[0] / 255.0f;
+			float src_g = triangleRgba[1] / 255.0f;
+			float src_b = triangleRgba[2] / 255.0f;
+			float src_a = triangleRgba[3] / 255.0f;
+
+			// front-to-back Porter-Duff "over"
+			rgba.r += src_r * src_a * remainingTranslucency;
+			rgba.g += src_g * src_a * remainingTranslucency;
+			rgba.b += src_b * src_a * remainingTranslucency;
+			rgba.a += src_a * remainingTranslucency;
+
+			remainingTranslucency *= (1.0f - src_a);
+			
+		}
+	}
+	
+	if(x > 0 && x < args.target.width)
+	if(y > 0 && y < args.target.height)
+	{
+		
+		u64 currentPixel = args.target.colorbuffer[pixelID];
+		u32 currentColor = currentPixel & 0xffffffff;
+		u8* currentRGBA = (u8*)&currentPixel;
+		
+		// rgba.x = float(currentRGBA[0]) / 256.0f;
+		// rgba.y = float(currentRGBA[1]) / 256.0f;
+		// rgba.z = float(currentRGBA[2]) / 256.0f;
+		// rgba.w = 0.0f;
+		
+	
+		
+		u32 C = 0;
+		u8* RGBA = (u8*)&C;
+		
+		RGBA[0] = clamp((1.0f - rgba.a) * currentRGBA[0] + rgba.r * 255.0f, 0.0f, 255.0f);
+		RGBA[1] = clamp((1.0f - rgba.a) * currentRGBA[1] + rgba.g * 255.0f, 0.0f, 255.0f);
+		RGBA[2] = clamp((1.0f - rgba.a) * currentRGBA[2] + rgba.b * 255.0f, 0.0f, 255.0f);
+		RGBA[3] = 255.0f;
+		
+		
+		// if(rgba.a > 0){
+			// RGBA[0] = clamp(rgba.r * 255.0f, 0.0f, 255.0f);
+			// RGBA[1] = clamp(rgba.g * 255.0f, 0.0f, 255.0f);
+			// RGBA[2] = clamp(rgba.b * 255.0f, 0.0f, 255.0f);
+			// RGBA[3] = clamp(rgba.a * 255.0f, 0.0f, 255.0f);
+		// }
+		
+		u64 udepth = __float_as_uint(depth);
+		u64 pixel = udepth << 32 | C;
+		
+		args.target.colorbuffer[pixelID] = pixel;
+		
+	}
+	
+	
+	
+	
+	
 }

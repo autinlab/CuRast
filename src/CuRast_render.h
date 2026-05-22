@@ -107,6 +107,8 @@ void drawTrianglesVisbuffer(
 ){
 	auto editor = CuRast::instance;
 
+	if(meshes.size() == 0) return;
+
 	static CUdeviceptr cptr_numProcessedBatches             = MemoryManager::alloc(4, "cptr_numProcessedBatches");
 	static CUdeviceptr cptr_numProcessedBatches_nontrivial  = MemoryManager::alloc(4, "cptr_numProcessedBatches_nontrivial");
 	static CUdeviceptr cptr_hugeTriangles                   = MemoryManager::alloc(MAX_HUGE_TRIANGLES * sizeof(HugeTriangle), "cptr_hugeTriangles");
@@ -179,6 +181,9 @@ void drawTrianglesTranslucent(
 	static CUdeviceptr cptr_queueKeyValueSorted             = MemoryManager::alloc(MAX_TRANSLUCENT_TRIANGLES * sizeof(uint64_t), "cptr_queueKeyValueSorted");
 	static CUdeviceptr cptr_queueSize                       = MemoryManager::alloc(4, "cptr_queueSize");
 	
+	int maxTiles = 512 * 512; // Each tile is 16x16, so allows 8k x 8k 
+	static CUdeviceptr cptr_tileRanges                      = MemoryManager::alloc(sizeof(ivec2) * maxTiles, "cptr_tileRanges");
+	
 	static CudaModularProgram* prog = new CudaModularProgram({
 		.modules = {"./src/kernels/triangles_translucent.cu",}
 	});
@@ -209,6 +214,8 @@ void drawTrianglesTranslucent(
 	// string strKernelStage1 = format("kernel_binning", strCompressed, strInstanced);
 	// string strKernelStage2 = format("kernel_", strCompressed);
 	
+	cuMemsetD8(cptr_queueSize, 0, 4);
+	
 	auto custart = Timer::recordCudaTimestamp();
 	prog->launchCooperative("kernel_stage1_binning", vector<void*>{&args, &cptr_queueTriangles, &cptr_queueKeyValue, &cptr_queueSize}, {.blocksize = TRIANGLES_PER_SWEEP});
 	// prog->launchCooperative(strKernelStage2, vector<void*>{&args});
@@ -223,6 +230,29 @@ void drawTrianglesTranslucent(
 			static_cast<int>(queueSize)
 		);
 	}
+	
+	u32 tiles_x = (target.width + 16 - 1) / 16;
+	u32 tiles_y = (target.height + 16 - 1) / 16;
+	u32 numTiles = tiles_x * tiles_y;
+	cuMemsetD8(cptr_tileRanges, 0, sizeof(ivec2) * numTiles);
+	
+	prog->launchCooperative("kernel_stage3_computeRanges", vector<void*>{
+		&args, 
+		&cptr_queueTriangles, 
+		&cptr_queueKeyValueSorted, 
+		&cptr_queueSize,
+		&cptr_tileRanges,
+		&numTiles,
+	});
+	
+	prog->launch("kernel_stage4_blend", vector<void*>{
+		&args, 
+		&cptr_queueTriangles, 
+		&cptr_queueKeyValueSorted, 
+		&cptr_queueSize,
+		&cptr_tileRanges,
+		&numTiles,
+	}, {.gridsize = numTiles, .blocksize = 256});
 
 	auto cuend = Timer::recordCudaTimestamp();
 	Timer::recordDuration("<triangles translucent pipeline>", custart, cuend);
@@ -267,6 +297,11 @@ void CuRast::draw(Scene* scene, vector<View> views){
 	static vector<SNTriangles*> nodes;
 	nodes.clear();
 	scene->forEach<SNTriangles>([&](SNTriangles* node){
+		
+		// if(!node->texture->isTranslucent) return;
+		// if(nodes.size() >= 1) return;
+		// if(node->mesh->numTriangles != 400) return;
+		
 		nodes.push_back(node);
 		if(node->texture){
 			hasJpegCompressedTextures = hasJpegCompressedTextures || node->texture->huffmanTables != nullptr;

@@ -72,6 +72,13 @@ void initScene() {
 		Runtime::controls->pitch  = 0.009;
 		Runtime::controls->radius = 336.359;
 		Runtime::controls->target = { -2.986, 32.881, 119.491, };
+		
+		// position: 263.7379384641819, 6.640367150195331, 3.800507537091093 
+		Runtime::controls->yaw    = -10.021;
+		Runtime::controls->pitch  = -0.748;
+		Runtime::controls->radius = 208.852;
+		Runtime::controls->target = { 146.463, -119.985, 121.410};
+
 	};
 
 	auto loadSponzaJPEG = [=](){ 
