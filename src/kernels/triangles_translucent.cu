@@ -270,7 +270,15 @@ void binning(
 		t.tile_y = int(min_y) / TILE_SIZE_TRANSLUCENT + ly;
 		t.triangleIndex = triangleIndex;
 		
-		float depth = a_ndc.z;
+		float cx = (t.tile_x + 0.5f) * TILE_SIZE_TRANSLUCENT;
+		float cy = (t.tile_y + 0.5f) * TILE_SIZE_TRANSLUCENT;
+		float ndc_x = 2.0f * cx / float(args.target.width) - 1.0f;
+		float ndc_y = 2.0f * cy / float(args.target.height) - 1.0f;
+		vec3 ray_dir = {ndc_x * aspect / f, ndc_y / f, -1.0f};
+
+		vec3 plane_normal = cross(b_view - a_view, c_view - a_view);
+		float denom = dot(plane_normal, ray_dir);
+		float depth = (abs(denom) > 1e-6f) ? dot(plane_normal, a_view) / denom : a_ndc.z;
 		u64 keyValue = encodeTranslucentKeyValue(t.tile_x, t.tile_y, depth, queueIndexStart + i);
 			
 		queueTriangles[queueIndexStart + i] = t;
@@ -573,6 +581,25 @@ void kernel_stage4_blend(
 		// blend triangles
 		int numTriangles = min(numPiecesInTile - PREFETCH_COUNT * iteration, PREFETCH_COUNT);
 		
+		// Stash some fragments. We'll blend the closest of multiple stashed ones in each iteration.
+		vec4 stashedColor[4] = {};
+		float stashedDepth[4] = {Infinity, Infinity, Infinity, Infinity};
+
+		// Process the closest stashed fragment
+		auto blendMin = [&]() {
+			int minIdx = 0;
+			for(int k = 1; k < 4; k++)
+				if(stashedDepth[k] < stashedDepth[minIdx]) minIdx = k;
+			if(stashedDepth[minIdx] == Infinity) return;
+			vec4 c = stashedColor[minIdx];
+			rgba.r += c.r * c.a * remainingTranslucency;
+			rgba.g += c.g * c.a * remainingTranslucency;
+			rgba.b += c.b * c.a * remainingTranslucency;
+			rgba.a += c.a * remainingTranslucency;
+			remainingTranslucency *= (1.0f - c.a);
+			stashedDepth[minIdx] = Infinity;
+		};
+		
 		for(int i = 0; i < numTriangles; i++){
 			TranslucentTriangle triangle = sh_triangles[i];
 			CMesh& mesh = args.meshes[triangle.meshIndex];
@@ -585,12 +612,6 @@ void kernel_stage4_blend(
 			vec3 a_view = worldView * a_object;
 			vec3 b_view = worldView * b_object;
 			vec3 c_view = worldView * c_object;
-			// vec3 a_ndc = viewToNDC(a_view, f, aspect);
-			// vec3 b_ndc = viewToNDC(b_view, f, aspect);
-			// vec3 c_ndc = viewToNDC(c_view, f, aspect);
-			// vec2 a_screen = ndcToScreen(a_ndc, args.target.width, args.target.height);
-			// vec2 b_screen = ndcToScreen(b_ndc, args.target.width, args.target.height);
-			// vec2 c_screen = ndcToScreen(c_ndc, args.target.width, args.target.height);
 			
 			vec2 a_uv = getUV(mesh, 3 * triangle.triangleIndex + 0);
 			vec2 b_uv = getUV(mesh, 3 * triangle.triangleIndex + 1);
@@ -615,24 +636,35 @@ void kernel_stage4_blend(
 			if(t_view > depth) continue;
 			
 			
-
 			uint32_t triangleColor = sampleColor_linear(mesh.texture.data, mesh.texture.width, mesh.texture.height, uv);
 			u8* triangleRgba = (u8*)&triangleColor;
 
 			float src_r = triangleRgba[0] / 255.0f;
 			float src_g = triangleRgba[1] / 255.0f;
 			float src_b = triangleRgba[2] / 255.0f;
-			float src_a = triangleRgba[3] / 255.0f;
-
-			// front-to-back Porter-Duff "over"
-			rgba.r += src_r * src_a * remainingTranslucency;
-			rgba.g += src_g * src_a * remainingTranslucency;
-			rgba.b += src_b * src_a * remainingTranslucency;
-			rgba.a += src_a * remainingTranslucency;
-
-			remainingTranslucency *= (1.0f - src_a);
+			float src_a = (triangleRgba[3] / 255.0f);
 			
+			// Find a slot to insert the new fragment
+			int slot = -1;
+			for(int k = 0; k < 4; k++) {
+				if(stashedDepth[k] == Infinity) { slot = k; break; }
+			}
+			
+			// If no slot available, process the closest one, then look again.
+			if(slot == -1) {
+				blendMin();
+				for(int k = 0; k < 4; k++) {
+					if(stashedDepth[k] == Infinity) { slot = k; break; }
+				}
+			}
+			
+			// Add fragment to empty stash slot.
+			stashedColor[slot] = {src_r, src_g, src_b, src_a};
+			stashedDepth[slot] = t_view;
 		}
+		
+		// Blend remaing stashed fragments
+		for(int k = 0; k < 4; k++) blendMin();
 	}
 	
 	if(x > 0 && x < args.target.width)

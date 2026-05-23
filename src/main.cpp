@@ -73,11 +73,13 @@ void initScene() {
 		Runtime::controls->radius = 336.359;
 		Runtime::controls->target = { -2.986, 32.881, 119.491, };
 		
-		// position: 263.7379384641819, 6.640367150195331, 3.800507537091093 
-		Runtime::controls->yaw    = -10.021;
-		Runtime::controls->pitch  = -0.748;
-		Runtime::controls->radius = 208.852;
-		Runtime::controls->target = { 146.463, -119.985, 121.410};
+		// position: 85.56503842133353, -126.16710469214773, 27.111462557161722 
+		Runtime::controls->yaw    = -8.666;
+		Runtime::controls->pitch  = -0.660;
+		Runtime::controls->radius = 45.452;
+		Runtime::controls->target = { 116.838, -152.214, 47.347};
+		CuRastSettings::enableEDL = false;
+
 
 	};
 
