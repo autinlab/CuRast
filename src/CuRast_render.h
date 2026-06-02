@@ -168,6 +168,8 @@ void drawTrianglesTranslucent(
 ){
 	auto editor = CuRast::instance;
 
+	if(meshes.size() == 0) return;
+
 	static CUdeviceptr cptr_numProcessedBatches             = MemoryManager::alloc(4, "cptr_numProcessedBatches");
 	static CUdeviceptr cptr_numProcessedBatches_nontrivial  = MemoryManager::alloc(4, "cptr_numProcessedBatches_nontrivial");
 	static CUdeviceptr cptr_hugeTriangles                   = MemoryManager::alloc(MAX_HUGE_TRIANGLES * sizeof(HugeTriangle), "cptr_hugeTriangles");
