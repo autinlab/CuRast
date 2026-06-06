@@ -445,6 +445,9 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		
 		for(CMesh mesh : meshes_unique){
 			bool isTranslucent = mesh.texture.isTranslucent;
+			if(!CuRastSettings::enableTranslucency){
+				isTranslucent = false;
+			}
 			
 			if(isTranslucent){
 				meshes_unique_translucent.push_back(mesh);

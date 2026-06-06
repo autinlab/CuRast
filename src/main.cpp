@@ -74,10 +74,10 @@ void initScene() {
 		Runtime::controls->target = { -2.986, 32.881, 119.491, };
 		
 		// position: 85.56503842133353, -126.16710469214773, 27.111462557161722 
-		Runtime::controls->yaw    = -8.666;
-		Runtime::controls->pitch  = -0.660;
-		Runtime::controls->radius = 45.452;
-		Runtime::controls->target = { 116.838, -152.214, 47.347};
+		// Runtime::controls->yaw    = -8.666;
+		// Runtime::controls->pitch  = -0.660;
+		// Runtime::controls->radius = 45.452;
+		// Runtime::controls->target = { 116.838, -152.214, 47.347};
 		CuRastSettings::enableEDL = false;
 
 
@@ -303,7 +303,7 @@ void initScene() {
 	// loadXyzDragon();
 	// loadSpot();
 	// loadWietrznia();
-	loadSponza();
+	// loadSponza();
 	// loadSponzaJPEG();
 	// loadCubeJpeg();
 	// loadPolygraphenewerkLeibzigInstances();

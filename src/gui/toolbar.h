@@ -159,6 +159,8 @@ void CuRast::makeToolbar(){
 
 				ImGui::Checkbox("Enable Picking", &CuRastSettings::enableObjectPicking);
 				ImGui::SameLine();
+				ImGui::Checkbox("Enable Translucency", &CuRastSettings::enableTranslucency);
+				ImGui::SameLine();
 				ImGui::Checkbox("Inset", &CuRastSettings::showInset);
 				
 				// ImGui::SameLine();
