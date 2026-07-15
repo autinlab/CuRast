@@ -99,6 +99,40 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 
 #include "CuRast_vulkanRender.h"
 
+void drawPoints(Scene* scene, View view, RenderTarget& target){
+	
+	static CudaModularProgram* prog = new CudaModularProgram({
+		.modules = {"./src/kernels/points.cu",}
+	});
+	
+	
+	vector<SNCPoints*> nodes;
+	scene->forEach<SNCPoints>([&](SNCPoints* node){
+		nodes.push_back(node);
+	});
+	
+	u64 totalPoints = 0;
+	for(SNCPoints* node : nodes){
+		
+		mat4 worldView = mat4(view.view * node->transform_global);
+		
+		void* args[] = {
+			&target,
+			&node->cptr_positions,
+			&node->cptr_colors,
+			&node->numPoints,
+			&worldView
+		};
+		prog->launchCooperative("kernel_drawPoints", args, {.blocksize = 256});
+		
+		totalPoints += node->numPoints;
+	}
+	
+	auto& dvlist = Runtime::debugValueList;
+	dvlist.push_back({"num points", format("{:L}", totalPoints)});
+	
+}
+
 void drawTrianglesVisbuffer(
 	Scene* scene, View view, vector<CMesh>& meshes, 
 	vector<CMesh>& instances, CUdeviceptr cptr_meshes,
@@ -617,6 +651,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			};
 			prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D", args, target.width, target.height);
 		}
+		
+		drawPoints(scene, view, target);
 		
 		drawTrianglesTranslucent(
 			scene, view, meshes_unique_translucent, meshes_allInstances, 
