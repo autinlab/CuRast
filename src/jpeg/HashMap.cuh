@@ -50,7 +50,12 @@ struct HashMap{
 
 		for(int i = 0; i < MAX_ATTEMPTS; i++){
 			int probeIndex = (hashIndex + i) % capacity;
-			uint64_t old = atomicCAS(&entries[probeIndex], EMPTYENTRY, element);
+			// CUDA provides atomicCAS for unsigned long long but not unsigned long, which is
+			// what uint64_t is on LP64. Both are 64-bit, so the cast is well-defined.
+			uint64_t old = atomicCAS(
+				(unsigned long long*)&entries[probeIndex],
+				(unsigned long long)EMPTYENTRY,
+				(unsigned long long)element);
 
 			if(old == EMPTYENTRY){
 				*location = probeIndex;
