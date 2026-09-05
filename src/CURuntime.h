@@ -5,7 +5,12 @@
 #include <unordered_map>
 #include <map>
 #include <vector>
-#include <stacktrace>
+#if !defined(__linux__)
+	// Not on Linux: gcc-toolset-14 has no libstdc++exp, so std::stacktrace cannot link and
+	// unsuck.hpp substitutes its own. Including this header would make `stacktrace`
+	// ambiguous against the substitute wherever `using namespace std` is in effect.
+	#include <stacktrace>
+#endif
 
 #include "OrbitControls.h"
 #include "unsuck.hpp"
