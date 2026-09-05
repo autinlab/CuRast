@@ -48,7 +48,30 @@ using std::make_shared;
 using std::chrono::high_resolution_clock;
 using std::mutex;
 using std::println;
-using std::stacktrace;
+
+// Red Hat's gcc-toolset-14 ships the <stacktrace> header but not libstdc++exp.a, which is
+// where std::stacktrace's out-of-line support lives, so std::stacktrace::current() and its
+// formatter do not link. Substitute a stand-in with the same call shape (default-argument
+// capture at call sites, "{}" formatting) built on glibc's backtrace().
+#if defined(__linux__)
+	namespace curast {
+		struct stacktrace {
+			string text;
+			static stacktrace current();
+		};
+	}
+
+	template<>
+	struct std::formatter<curast::stacktrace> : std::formatter<string> {
+		auto format(const curast::stacktrace& trace, auto& ctx) const {
+			return std::formatter<string>::format(trace.text, ctx);
+		}
+	};
+
+	using curast::stacktrace;
+#else
+	using std::stacktrace;
+#endif
 
 namespace fs = std::filesystem;
 

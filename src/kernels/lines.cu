@@ -81,7 +81,7 @@ void drawLine(int x0, int y0, int x1, int y1, RenderTarget target){
 			float depth = 0.1f;
 			uint64_t udepth = __float_as_uint(depth);
 			uint64_t pixel = (udepth << 32ull) | 0xffff00ff;
-			atomicMin(&target.colorbuffer[pixelID], pixel);
+			atomicMin((unsigned long long*)&target.colorbuffer[pixelID], (unsigned long long)pixel);
 		}
 
 		if (x0 == x1 && y0 == y1) break;
@@ -161,7 +161,7 @@ void drawLine(vec3 start, vec3 end, uint32_t color = 0xff0000ff){
 			// uint64_t pixel = pack_pixel(depth, meshIndex, triangleIndex);
 			uint64_t udepth = __float_as_uint(depth);
 			uint64_t pixel = (udepth << 32) | color;
-			atomicMin(&c_target.framebuffer[pixelID], pixel);
+			atomicMin((unsigned long long*)&c_target.framebuffer[pixelID], (unsigned long long)pixel);
 		}
 
 		block.sync();

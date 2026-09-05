@@ -68,7 +68,7 @@ struct CURuntime{
 	}
 
 
-	static void assertCudaSuccess(CUresult result, std::stacktrace trace = std::stacktrace::current()){
+	static void assertCudaSuccess(CUresult result, stacktrace trace = stacktrace::current()){
 
 		if(result == CUDA_SUCCESS) return;
 

@@ -605,6 +605,33 @@ CpuData getCpuData() {
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <execinfo.h>
+
+// Stand-in for std::stacktrace::current(); see the note in unsuck.hpp. Build with
+// -rdynamic to get function names out of backtrace_symbols rather than bare addresses.
+curast::stacktrace curast::stacktrace::current(){
+
+	void* frames[64];
+	int numFrames = backtrace(frames, 64);
+
+	curast::stacktrace trace;
+
+	if(numFrames <= 0) return trace;
+
+	char** symbols = backtrace_symbols(frames, numFrames);
+
+	if(symbols == nullptr) return trace;
+
+	// Skip frame 0, which is always this function.
+	for(int i = 1; i < numFrames; i++){
+		trace.text += symbols[i];
+		trace.text += "\n";
+	}
+
+	free(symbols);
+
+	return trace;
+}
 
 void hideConsole(){
 	// No separate console window to hide when launched from a shell.

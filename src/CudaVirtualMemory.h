@@ -11,7 +11,8 @@
 using std::println;
 using std::mutex;
 using std::lock_guard;
-using std::stacktrace;
+// stacktrace comes from unsuck.hpp: on Linux it is a stand-in for std::stacktrace,
+// so pulling std::stacktrace in here too would make unqualified uses ambiguous.
 
 // see https://developer.nvidia.com/blog/introducing-low-level-gpu-virtual-memory-management/
 struct CudaVirtualMemory{
