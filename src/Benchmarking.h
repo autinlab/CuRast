@@ -49,7 +49,15 @@ struct Benchmarking{
 		return scenario->path.contains("_optimized");
 	}
 
-	static inline vector<Scenario> scenarios = {
+	static vector<Scenario> scenarios;
+
+};
+
+// Defined out of class on purpose: inside the class body, Scenario's default member
+// initializers are not yet complete, so aggregate-initializing a Scenario there is
+// ill-formed. MSVC accepts it, GCC and Clang reject it. The out-of-class definition is
+// still in Benchmarking's scope, so Scenario and DisplayAttribute resolve unqualified.
+inline vector<Benchmarking::Scenario> Benchmarking::scenarios = {
 		Scenario{
 			.path      = "DATASETPATH/sponza-png_by_Ludicon.glb",
 			.label     = "Sponza",
@@ -339,8 +347,6 @@ struct Benchmarking{
 				return true;
 			},
 		},
-	};
-
 };
 
 
