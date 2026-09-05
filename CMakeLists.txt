@@ -8,7 +8,19 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 include(cmake/common.cmake)
 
 # Paths to TurboJPEG
-set(TURBOJPEG_LIBRARY "${CMAKE_SOURCE_DIR}/libs/jpg/turbojpeg-static.lib") 
+# The bundled libs/jpg/turbojpeg.h is from libjpeg-turbo 3.1.1; the prebuilt .lib next to it
+# is Windows-only. On other platforms point TURBOJPEG_LIBRARY at a matching 3.1.x build.
+if (WIN32)
+	set(TURBOJPEG_LIBRARY "${CMAKE_SOURCE_DIR}/libs/jpg/turbojpeg-static.lib")
+else()
+	find_library(TURBOJPEG_LIBRARY NAMES turbojpeg
+		HINTS ENV TURBOJPEG_ROOT
+		PATH_SUFFIXES lib lib64)
+	if (NOT TURBOJPEG_LIBRARY)
+		message(FATAL_ERROR "libturbojpeg not found. Build libjpeg-turbo 3.1.x and set TURBOJPEG_ROOT.")
+	endif()
+	message(STATUS "TURBOJPEG_LIBRARY:            ${TURBOJPEG_LIBRARY}")
+endif()
 
 # --------------------------------------------------------
 # Source files (C++ and CUDA)
@@ -59,8 +71,17 @@ ADD_IMGUI(${TARGET_NAME})
 # --------------------------------------------------------
 # CUDA configuration
 # --------------------------------------------------------
-# Choose GPU architectures (adjust for your machine)
-set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)
+# Choose GPU architectures (adjust for your machine).
+# 120 = Blackwell (RTX PRO 6000, CC 12.0) and needs CUDA >= 12.9.
+# Override with -D CURAST_CUDA_ARCH=120 to build a single arch; the full list is slow
+# under separable compilation. Set on the target too: the bare set() below runs after
+# add_executable(), so it would otherwise not reach the already-created target.
+if (NOT CURAST_CUDA_ARCH)
+	set(CURAST_CUDA_ARCH 75 86 89 90 120)
+endif()
+set(CMAKE_CUDA_ARCHITECTURES ${CURAST_CUDA_ARCH})
+set_property(TARGET ${TARGET_NAME} PROPERTY CUDA_ARCHITECTURES ${CURAST_CUDA_ARCH})
+message(STATUS "CURAST_CUDA_ARCH:             ${CURAST_CUDA_ARCH}")
 
 # Enable separable compilation (for multi-file CUDA builds)
 set_target_properties(${TARGET_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
