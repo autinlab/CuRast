@@ -11,6 +11,12 @@ namespace Mapping{
 #ifdef _WIN32
 	#define NOMINMAX
 	#include "windows.h"
+#elif defined(__linux__)
+	#include <fcntl.h>
+	#include <sys/mman.h>
+	#include <sys/stat.h>
+	#include <unistd.h>
+	#include <cstring>
 #endif
 
 // Usage:
@@ -33,7 +39,9 @@ struct MappedFile{
 		HANDLE h_mapping;
 		void* data = nullptr;
 	#elif defined(__linux__)
-		TODO
+		int fd = -1;
+		size_t size = 0;
+		void* data = nullptr;
 	#endif
 
 	~MappedFile(){
@@ -47,6 +55,16 @@ struct MappedFile{
 				CloseHandle(h_mapping);
 				CloseHandle(h_file);
 				data = nullptr;
+			}
+		#elif defined(__linux__)
+			if(data != nullptr){
+				munmap(data, size);
+				data = nullptr;
+				size = 0;
+			}
+			if(fd != -1){
+				close(fd);
+				fd = -1;
 			}
 		#endif
 	}
@@ -112,7 +130,33 @@ shared_ptr<MappedFile> mapFile(string path){
 		}
 
 	#elif defined(__linux__)
-		TODO
+		file->fd = open(path.c_str(), O_RDONLY);
+
+		if(file->fd == -1){
+			println("failed to map file {}", path);
+			exit(143146);
+		}
+
+		struct stat st;
+		if(fstat(file->fd, &st) == -1){
+			println("fstat failed for {}", path);
+			exit(524631);
+		}
+		file->size = size_t(st.st_size);
+
+		// mmap rejects a zero length; an empty file has nothing to read anyway.
+		if(file->size == 0){
+			println("refusing to map empty file {}", path);
+			exit(524632);
+		}
+
+		file->data = mmap(nullptr, file->size, PROT_READ, MAP_PRIVATE, file->fd, 0);
+
+		if(file->data == MAP_FAILED){
+			file->data = nullptr;
+			println("mmap failed for {}", path);
+			exit(642324);
+		}
 	#endif
 
 	return file;

@@ -45,9 +45,15 @@ mat4 flip = mat4(
 void initCuda() {
 	cuInit(0);
 	
-	CUctxCreateParams creation_params = {};
 	cuDeviceGet(&CURuntime::device, 0);
-	cuCtxCreate(&context, &creation_params, 0, CURuntime::device);
+
+	// cuCtxCreate gained a CUctxCreateParams* argument in CUDA 13; 12.x takes flags only.
+	#if CUDA_VERSION >= 13000
+		CUctxCreateParams creation_params = {};
+		cuCtxCreate(&context, &creation_params, 0, CURuntime::device);
+	#else
+		cuCtxCreate(&context, 0, CURuntime::device);
+	#endif
 }
 
 
