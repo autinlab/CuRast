@@ -35,7 +35,13 @@ function(ADD_GLM TARGET_NAME)
 endfunction()
 
 function(ADD_CUDA TARGET_NAME)
-	find_package(CUDAToolkit 13.1 REQUIRED)
+	# 12.9 is the floor, not 13.1: it is the first widely deployed toolkit with
+	# sm_120 (Blackwell) plus the nvrtc/nvJitLink LTO path this project uses, and
+	# it is what the Garibaldi cluster actually has installed.
+	if (NOT CURAST_CUDA_MIN_VERSION)
+		set(CURAST_CUDA_MIN_VERSION 12.9)
+	endif()
+	find_package(CUDAToolkit ${CURAST_CUDA_MIN_VERSION} REQUIRED)
 	find_library(CUDA_DEVRTLIB NAMES cudadevrt libcudadevrt PATHS "${CUDAToolkit_LIBRARY_DIR}")
 
 	MESSAGE(STATUS "CUDAToolkit_INCLUDE_DIRS:     " ${CUDAToolkit_INCLUDE_DIRS})
