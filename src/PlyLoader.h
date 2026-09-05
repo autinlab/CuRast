@@ -117,7 +117,9 @@ namespace PlyLoader{
 		// }
 
 		
-		string strProbableHeader((const char*)mappedFile->data, min(fs::file_size(path), 10'000llu));
+		// Explicit template argument: fs::file_size returns uintmax_t, which is not
+		// unsigned long long on LP64, so min() cannot deduce a common type from the literal.
+		string strProbableHeader((const char*)mappedFile->data, min<uintmax_t>(fs::file_size(path), 10'000));
 		size_t pos_headerToken = strProbableHeader.find("end_header");
 		if(pos_headerToken == string::npos){
 			println("could not find end of header in ply file");

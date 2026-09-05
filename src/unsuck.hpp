@@ -813,8 +813,13 @@ inline std::locale getSaneLocale(){
 	return std::locale(std::cout.getloc(), new punct_facet);
 }
 
-template<typename T>
-inline T roundUp(T number, T granularity){
+// The granularity is a separate template parameter on purpose: call sites pass literals
+// like 16llu / 12ll next to uint64_t or int64_t values, and on LP64 (Linux) uint64_t is
+// unsigned long, not unsigned long long, so a single T fails to deduce. The result keeps
+// the type of `number`, which is what every call site already assumed.
+template<typename T, typename U>
+inline T roundUp(T number, U granularity_){
+	T granularity = T(granularity_);
 	T count = (number + granularity - 1) / granularity;
 
 	return count * granularity;
