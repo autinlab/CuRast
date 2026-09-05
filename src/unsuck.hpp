@@ -3,6 +3,12 @@
 
 #define NOMINMAX
 
+// __debugbreak is an MSVC intrinsic. The call sites use it as "stop here, this is a bug",
+// so on other compilers trap instead — same intent, and a debugger still catches it.
+#if !defined(_MSC_VER) && !defined(__debugbreak)
+	#define __debugbreak() __builtin_trap()
+#endif
+
 #include <string>
 #include <vector>
 #include <fstream>
