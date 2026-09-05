@@ -752,15 +752,22 @@ static shared_ptr<LoadedMmcif> load(const string& filepath, CUcontext /*ctx*/, L
 	sn->cptr_palette   = cptr_palette;
 	sn->numSpheres     = (uint32_t)totalAtoms;
 
-	// Compute centroid, AABB and bounding radius
-	vec3 centroid = {0.0f, 0.0f, 0.0f};
+	// Compute centroid, AABB and bounding radius.
+	// The running sum MUST be double. At 71.5M atoms with coordinates of a few thousand
+	// angstroms the float32 total reaches ~2e11, where one ulp is ~24000 - far larger than
+	// the values still being added, so every further addition is silently discarded and the
+	// centroid lands outside the AABB. That in turn mis-aims the camera, because the load
+	// path frames on exactly this point.
+	glm::dvec3 centroidAcc = {0.0, 0.0, 0.0};
 	vec3 aabbMin = positions[0], aabbMax = positions[0];
 	for(uint64_t i = 0; i < totalAtoms; i++) {
-		centroid += positions[i];
+		centroidAcc += glm::dvec3(positions[i]);
 		aabbMin = glm::min(aabbMin, positions[i]);
 		aabbMax = glm::max(aabbMax, positions[i]);
 	}
-	if(totalAtoms > 0) centroid /= float(totalAtoms);
+	vec3 centroid = totalAtoms > 0
+		? vec3(centroidAcc / double(totalAtoms))
+		: vec3(0.0f);
 
 	float maxDist = 0.0f;
 	for(uint64_t i = 0; i < totalAtoms; i++) {
