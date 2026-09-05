@@ -8,12 +8,19 @@ namespace cg = cooperative_groups;
 #define FALSE 0
 #define TRUE 1
 
-typedef unsigned int uint32_t;
-typedef int int32_t;
-// typedef char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned long long uint64_t;
-typedef long long int64_t;
+#if defined(__CUDACC_RTC__)
+	// NVRTC has no system headers, so the fixed-width types have to be spelled out here.
+	typedef unsigned int uint32_t;
+	typedef int int32_t;
+	// typedef char int8_t;
+	typedef unsigned char uint8_t;
+	typedef unsigned long long uint64_t;
+	typedef long long int64_t;
+#else
+	// Offline nvcc does see <cstdint>. Redeclaring the types conflicts with glibc, where
+	// uint64_t is unsigned long rather than unsigned long long.
+	#include <cstdint>
+#endif
 
 constexpr uint32_t MAX_STRING_LENGTH = 1'000;
 

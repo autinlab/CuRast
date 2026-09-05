@@ -57,10 +57,23 @@ target_include_directories(${TARGET_NAME} PRIVATE
 )
 
 add_subdirectory(libs/laszip)
-target_link_libraries(${TARGET_NAME} PRIVATE 
+target_link_libraries(${TARGET_NAME} PRIVATE
 	${TURBOJPEG_LIBRARY}
 	laszip
 )
+
+if (NOT WIN32)
+	# libstdc++ needs these spelled out where MSVC does not:
+	#  - <execution> parallel algorithms dispatch to TBB
+	#  - <stacktrace> (used by unsuck.hpp) lives in libstdc++exp
+	find_package(TBB QUIET)
+	if (TBB_FOUND)
+		target_link_libraries(${TARGET_NAME} PRIVATE TBB::tbb)
+	else()
+		target_link_libraries(${TARGET_NAME} PRIVATE tbb)
+	endif()
+	target_link_libraries(${TARGET_NAME} PRIVATE stdc++exp)
+endif()
 
 # Add other third-party libs
 ADD_CUDA(${TARGET_NAME})
@@ -108,3 +121,13 @@ target_include_directories(PlyToGlb PRIVATE
 	./src
 	./libs
 )
+if (NOT WIN32)
+	# Same <execution>/<stacktrace> link requirements as the main target.
+	find_package(TBB QUIET)
+	if (TBB_FOUND)
+		target_link_libraries(PlyToGlb PRIVATE TBB::tbb)
+	else()
+		target_link_libraries(PlyToGlb PRIVATE tbb)
+	endif()
+	target_link_libraries(PlyToGlb PRIVATE stdc++exp)
+endif()

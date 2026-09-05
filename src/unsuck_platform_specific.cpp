@@ -594,5 +594,91 @@ CpuData getCpuData() {
 	return data;
 }
 
+// ---------------------------------------------------------------------------
+// Remaining platform entry points declared in unsuck.hpp. The Windows versions
+// use FILE_FLAG_NO_BUFFERING to bypass the page cache; these use ordinary pread
+// instead of O_DIRECT, because O_DIRECT imposes buffer/offset alignment rules
+// that the callers do not currently satisfy. Same results, page cache not bypassed.
+// ---------------------------------------------------------------------------
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+
+void hideConsole(){
+	// No separate console window to hide when launched from a shell.
+}
+
+void toClipboard(string str){
+	// X11 clipboard ownership needs a live window connection; not wired up here.
+	println("WARN: toClipboard is not implemented on this platform.");
+}
+
+uint64_t getPhysicalSectorSize(string path){
+	struct statvfs vfs;
+
+	if(statvfs(path.c_str(), &vfs) == 0 && vfs.f_frsize > 0){
+		return uint64_t(vfs.f_frsize);
+	}
+
+	return 4096;
+}
+
+shared_ptr<UnbufferedFile> UnbufferedFile::open(string path){
+
+	shared_ptr<UnbufferedFile> file = make_shared<UnbufferedFile>();
+	file->path = path;
+	file->sectorSize = int64_t(getPhysicalSectorSize(path));
+
+	int fd = ::open(path.c_str(), O_RDONLY);
+
+	if(fd == -1){
+		println("failed to open file {}", path);
+		file->handle = nullptr;
+		return file;
+	}
+
+	// handle is a void*; stash the descriptor in it so close()/read() can recover it.
+	file->handle = reinterpret_cast<void*>(intptr_t(fd));
+
+	return file;
+}
+
+void UnbufferedFile::read(uint64_t start, uint64_t size, void* target){
+
+	if(handle == nullptr) return;
+
+	int fd = int(reinterpret_cast<intptr_t>(handle));
+	uint8_t* dst = (uint8_t*)target;
+	uint64_t offset = 0;
+
+	// pread can return short reads; loop until the whole range is in.
+	while(offset < size){
+		ssize_t n = pread(fd, dst + offset, size_t(size - offset), off_t(start + offset));
+
+		if(n <= 0){
+			println("failed reading {} bytes at {} from {}", size, start, path);
+			return;
+		}
+
+		offset += uint64_t(n);
+	}
+}
+
+void UnbufferedFile::close(){
+
+	if(handle == nullptr) return;
+
+	::close(int(reinterpret_cast<intptr_t>(handle)));
+	handle = nullptr;
+}
+
+void readBinaryFileUnbuffered(string path, uint64_t start, uint64_t size, void* target){
+
+	auto file = UnbufferedFile::open(path);
+	file->read(start, size, target);
+	file->close();
+}
 
 #endif
