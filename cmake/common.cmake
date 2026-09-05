@@ -59,6 +59,13 @@ function(ADD_CUDA TARGET_NAME)
 	)
 
 	target_compile_definitions(${TARGET_NAME} PRIVATE CUDA_DEVRTLIB="${CUDA_DEVRTLIB}")
+
+	# NVRTC needs the toolkit include dir at runtime. Pass what CMake resolved rather than
+	# letting the app derive it from CUDA_DEVRTLIB: the lib layout differs between
+	# Windows (lib/x64) and Linux (targets/<arch>/lib via a lib64 symlink).
+	list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_INCLUDE_DIR_FIRST)
+	message(STATUS "CUDA_INCLUDE_DIR:             " ${CUDA_INCLUDE_DIR_FIRST})
+	target_compile_definitions(${TARGET_NAME} PRIVATE CUDA_INCLUDE_DIR="${CUDA_INCLUDE_DIR_FIRST}")
 endfunction()
 
 function(ADD_VULKAN TARGET_NAME)

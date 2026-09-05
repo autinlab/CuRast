@@ -110,17 +110,31 @@ struct CudaModule{
 		// point to a different (e.g. older) version, which would cause nvrtcCompileProgram
 		// to fail with incompatible headers.  Fall back to CUDA_PATH only when the build-
 		// time path no longer exists on disk.
-		string cuda_path_build = fs::path(CUDA_DEVRTLIB).parent_path().parent_path().parent_path().string();
-		const char* cuda_path_env = std::getenv("CUDA_PATH");
-		string cuda_path = fs::exists(cuda_path_build)
-			? cuda_path_build
-			: (cuda_path_env ? cuda_path_env : cuda_path_build);
-		string optInclude = std::format("-I {}", dir).c_str();
-		string cuda_include = std::format("-I {}/include", cuda_path);
-		string cudastd_include = std::format("-I {}/include/cccl/cuda/std", cuda_path);
-		string cccl_include = std::format("-I {}/include/cccl", cuda_path);
-		
-		println("cuda_path: {}", cuda_path);
+		// Use the include directory CMake resolved at build time. Walking up from
+		// CUDA_DEVRTLIB is wrong on Linux: the library lives under targets/<arch>/lib,
+		// normally reached through a lib64 symlink, which is one level shallower than
+		// the lib/x64 layout on Windows and yields a nonexistent <root>/include.
+		string cuda_include_dir = CUDA_INCLUDE_DIR;
+
+		if(!fs::exists(cuda_include_dir)){
+			const char* cuda_path_env = std::getenv("CUDA_PATH");
+			if(cuda_path_env) cuda_include_dir = string(cuda_path_env) + "/include";
+		}
+
+		string optInclude = std::format("-I {}", dir);
+		string cuda_include = std::format("-I {}", cuda_include_dir);
+
+		// CCCL (which is what supplies <cmath> and friends to NVRTC, since it has no system
+		// headers) moved to include/cccl in CUDA 13. In 12.x it sits directly under include.
+		bool hasCcclDir = fs::exists(cuda_include_dir + "/cccl");
+		string cudastd_include = hasCcclDir
+			? std::format("-I {}/cccl/cuda/std", cuda_include_dir)
+			: std::format("-I {}/cuda/std", cuda_include_dir);
+		string cccl_include = hasCcclDir
+			? std::format("-I {}/cccl", cuda_include_dir)
+			: std::format("-I {}", cuda_include_dir);
+
+		println("cuda_include_dir: {}", cuda_include_dir);
 		println("cudastd_include: {}", cudastd_include);
 		println("cccl_include: {}", cccl_include);
 
