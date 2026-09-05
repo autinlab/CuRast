@@ -112,6 +112,10 @@ void CuRast::inputHandling(){
 
 void CuRast::drawGUI() {
 
+	// Loading progress is always visible (even when the GUI is hidden) so the
+	// user can see what is happening after dropping a large file.
+	makeLoadingProgress();
+
 	if(!CuRastSettings::hideGUI){
 		makeMenubar();
 		makeToolbar();
@@ -358,6 +362,7 @@ void alignRight(string text) {
 #include "gui/widget_memory.h"
 #include "gui/widget_benchmarking.h"
 #include "gui/widget_timings.h"
+#include "gui/widget_loading.h"
 #include "gui/stats.h"
 
 void CuRast::makeDevGUI(){

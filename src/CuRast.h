@@ -13,6 +13,7 @@
 #include "./scene/SNTriangles.h"
 #include "./scene/SNPoints.h"
 #include "./scene/SNCPoints.h"
+#include "./scene/SNSpheres.h"
 
 #include "cuda.h"
 #include "cuda_runtime.h"
@@ -65,6 +66,7 @@ struct CuRast{
 	void makeDirectStats();
 	void makeToolbar();
 	void makeDevGUI();
+	void makeLoadingProgress();
 
 	// UPDATE & DRAW 
 	void update();

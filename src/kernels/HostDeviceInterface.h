@@ -324,3 +324,91 @@ struct RasterArgs{
 };
 
 extern __constant__ RenderTarget c_target;
+
+// Sphere LOD configuration. Each level defines a camera-distance band, an atom-skip
+// stride (atom is in level k iff sphereIdx % level[k].stride == 0), and a radius scale
+// (typically stride^(1/scaleBias) so projected screen area stays ~constant). At render
+// time each sphere picks the level whose [minDist..maxDist] band contains its distance
+// to the camera AND whose stride filter accepts its index.
+constexpr int MAX_SPHERE_LOD_LEVELS = 4;
+
+struct SphereLodLevel {
+	float minDist;     // sphere is invisible when camera distance < minDist (after fade-in band)
+	float maxDist;     // sphere is invisible when camera distance > maxDist (after fade-out band)
+	float overlap;     // width of the smoothstep fade band at each end of [minDist..maxDist]
+	float scale;       // radius multiplier when this level is fully active
+	int   stride;      // atom kept iff sphereIdx % stride == 0
+	int   _pad0;
+	int   _pad1;
+	int   _pad2;
+};
+
+struct SphereLodConfig {
+	int            numLevels;       // 0 = LOD disabled
+	int            _pad[3];
+	SphereLodLevel levels[MAX_SPHERE_LOD_LEVELS];
+};
+
+struct SphereRasterArgs {
+	vec3*     positions;          // GPU device ptr, world space
+	float*    radii;              // GPU device ptr
+	uint32_t* colors;             // GPU device ptr, RGBA8 — null when atomTypes/palette is used
+	uint8_t*  atomTypes;          // GPU device ptr, per-atom palette index (preferred path)
+	uint32_t* colorPalette;       // GPU device ptr, 256-entry RGBA8 LUT for atomTypes
+	uint32_t  numSpheres;
+	uint64_t* sphere_framebuffer; // separate from triangle framebuffer
+	SphereLodConfig lod;          // numLevels=0 → LOD off
+	// LOD per-launch state. The kernel maps thread tid to atom (tid * dispatchStride),
+	// so the host launches only numSpheres/dispatchStride threads per active level —
+	// avoiding the pay-then-cull pattern that was bandwidth-bound at high atom counts.
+	int activeLevel;              // -1 = no LOD active for this launch
+	int dispatchStride;           // 1 = no stride mapping (one thread per sphere)
+	// Partition rule: when multiple levels are active, this thread skips atoms that a
+	// coarser active level will render — preventing the doughnut artifact (same atom
+	// drawn twice at different scales). skipStride=0 disables the check.
+	int   skipStride;
+	float skipMinDist;            // coarser active level's distance band — only skip if
+	float skipMaxDist;            // the coarser level ACTUALLY covers this atom
+};
+
+#ifdef __CUDA_ARCH__
+// Per-sphere LOD selection. Returns the effective rasterization radius (0 = cull).
+// Picks the level with the largest effective radius (scale * fade) among levels whose
+// distance band contains `dist` AND whose stride accepts `sphereIdx`.
+__device__ inline float sphereLodScaledRadius(
+	const SphereLodConfig& cfg,
+	uint32_t sphereIdx,
+	float baseRadius,
+	float dist
+){
+	if(cfg.numLevels <= 0) return baseRadius;
+	float bestEff = -1.0f;
+	float bestRadius = 0.0f;
+	#pragma unroll
+	for(int k = 0; k < MAX_SPHERE_LOD_LEVELS; k++){
+		if(k >= cfg.numLevels) break;
+		const SphereLodLevel& L = cfg.levels[k];
+		if(L.stride > 1 && (sphereIdx % (uint32_t)L.stride) != 0u) continue;
+		if(dist < L.minDist || dist > L.maxDist) continue;
+
+		float fIn  = (L.overlap > 0.0f)
+			? __saturatef((dist - L.minDist) / L.overlap)
+			: 1.0f;
+		float fOut = (L.overlap > 0.0f)
+			? __saturatef((L.maxDist - dist) / L.overlap)
+			: 1.0f;
+		// smoothstep ish: 3t^2 - 2t^3
+		fIn  = fIn  * fIn  * (3.0f - 2.0f * fIn);
+		fOut = fOut * fOut * (3.0f - 2.0f * fOut);
+		float fade = fminf(fIn, fOut);
+		if(fade <= 0.0f) continue;
+
+		float eff = L.scale * fade;
+		if(eff > bestEff){
+			bestEff = eff;
+			bestRadius = baseRadius * eff;
+		}
+	}
+	return (bestEff > 0.0f) ? bestRadius : 0.0f;
+}
+#endif

@@ -278,6 +278,24 @@ void CuRast::makeToolbar(){
 				ImGui::Checkbox("Diffuse", &CuRastSettings::enableDiffuseLighting);
 				ImGui::SameLine();
 				ImGui::Checkbox("Wireframe", &CuRastSettings::showWireframe);
+				ImGui::SameLine();
+				ImGui::Checkbox("Sphere LOD", &CuRastSettings::enableSphereLOD);
+				if(ImGui::IsItemHovered()){
+					ImGui::SetTooltip(
+						"Skip every Nth atom and grow its radius as the camera pulls back.\n"
+						"Levels are scaled by the orbit radius so the bands track scene size.\n"
+						"Tune per-level stride / scale / band edges in the Benchmarking widget.");
+				}
+
+				if(CuRastSettings::enableSSAO){
+					ImGui::SameLine();
+					ImGui::Checkbox("Multiscale", &CuRastSettings::enableMultiscaleSSAO);
+					if(ImGui::IsItemHovered()){
+						ImGui::SetTooltip(
+							"Run SSAO at multiple radii (max-combine).\n"
+							"Catches both fine cavities and overall enclosure on large scenes.");
+					}
+				}
 				
 				ImGui::SameLine();
 				ImGui::Text("Background:");

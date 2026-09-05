@@ -474,6 +474,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugUtilsCallback(
 	if (data->messageIdNumber == (int32_t)0x101707af) return VK_FALSE; // <blabla> not marked with NonWritable
 
 	println("Vulkan: {}", data->pMessage);
+	fflush(stdout);
+	fflush(stderr);
 
 	__debugbreak();
 
@@ -597,7 +599,6 @@ void VKRenderer::createLogicalDevice() {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 		VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
 		VK_EXT_SHADER_OBJECT_EXTENSION_NAME,
-		VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
 #ifdef _WIN32
 		VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,

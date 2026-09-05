@@ -71,17 +71,22 @@ struct CudaModule{
 	string name = "";
 	bool compiled = false;
 	bool success = false;
+	bool useLTO = true;
 	vector<string> defines;
-	
+
 	size_t ptxSize = 0;
 	char* ptx = nullptr;
 
 	size_t ltoirSize = 0;
 	char* ltoir = nullptr;
 
-	CudaModule(string path, string name){
+	size_t cubinSize = 0;
+	char* cubin = nullptr;
+
+	CudaModule(string path, string name, bool useLTO = true){
 		this->path = path;
 		this->name = name;
+		this->useLTO = useLTO;
 	}
 
 	void compile(){
@@ -95,10 +100,16 @@ struct CudaModule{
 
 		string dir = fs::path(path).parent_path().string();
 
+		// Prefer the CUDA toolkit that was used to build this binary (CUDA_DEVRTLIB is a
+		// compile-time constant set by CMake).  The CUDA_PATH environment variable can
+		// point to a different (e.g. older) version, which would cause nvrtcCompileProgram
+		// to fail with incompatible headers.  Fall back to CUDA_PATH only when the build-
+		// time path no longer exists on disk.
+		string cuda_path_build = fs::path(CUDA_DEVRTLIB).parent_path().parent_path().parent_path().string();
 		const char* cuda_path_env = std::getenv("CUDA_PATH");
-		string cuda_path = cuda_path_env
-			? cuda_path_env
-			: fs::path(CUDA_DEVRTLIB).parent_path().parent_path().parent_path().string();
+		string cuda_path = fs::exists(cuda_path_build)
+			? cuda_path_build
+			: (cuda_path_env ? cuda_path_env : cuda_path_build);
 		string optInclude = std::format("-I {}", dir).c_str();
 		string cuda_include = std::format("-I {}/include", cuda_path);
 		string cudastd_include = std::format("-I {}/include/cccl/cuda/std", cuda_path);
@@ -116,16 +127,16 @@ struct CudaModule{
 		cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
 		cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
 
-		 string arch = format("--gpu-architecture=compute_{}{}", major, minor);
-		//string arch = "--gpu-architecture=compute_86";
+		// LTO requires virtual arch (compute_XX); direct cubin needs physical arch (sm_XX)
+		string arch = useLTO
+			? format("--gpu-architecture=compute_{}{}", major, minor)
+			: format("--gpu-architecture=sm_{}{}", major, minor);
 
 		nvrtcProgram prog;
 		string source = readFile(path);
 		nvrtcCreateProgram(&prog, source.c_str(), name.c_str(), 0, NULL, NULL);
 		
-		vector<const char*> opts = { 
-			// "--gpu-architecture=compute_75",
-			// "--gpu-architecture=compute_86",
+		vector<const char*> opts = {
 			arch.c_str(),
 			"--use_fast_math",
 			"--extra-device-vectorization",
@@ -137,17 +148,15 @@ struct CudaModule{
 			"-I ./",
 			"-I ./include",
 			"-I ./libs",
-			"--relocatable-device-code=true",
-			// "lcudadevrt",
-			"-default-device",                   // assume __device__ if not specified
-			"--dlink-time-opt",                  // link time optimization "-dlto", 
-			// "--dopt=on",
+			"-default-device",
 			"--std=c++20",
 			"--disable-warnings",
-			"--split-compile=0",                 // compiler optimizations in parallel. 0 -> max available threads
-			// "--time=cuda_compile_time.txt",      // show compiler timings
-			// "-pch",
+			"--split-compile=0",
 		};
+		if(useLTO){
+			opts.push_back("--relocatable-device-code=true");
+			opts.push_back("--dlink-time-opt");
+		}
 
 		// need to prepend "-D " to the defines, and need to keep the variables holding the c_str alive until compilation is done
 		vector<string> defineArgs;
@@ -183,11 +192,18 @@ struct CudaModule{
 			}
 		}
 
-		nvrtcGetLTOIRSize(prog, &ltoirSize);
-		ltoir = new char[ltoirSize];
-		nvrtcGetLTOIR(prog, ltoir);
-
-		cout << format("compiled ltoir. size: {} byte \n", ltoirSize);
+		if(useLTO){
+			nvrtcGetLTOIRSize(prog, &ltoirSize);
+			ltoir = new char[ltoirSize];
+			nvrtcGetLTOIR(prog, ltoir);
+			cout << format("compiled ltoir. size: {} byte \n", ltoirSize);
+		}else{
+			// Generate cubin directly — avoids LTO overhead and PTX JIT version issues
+			nvrtcGetCUBINSize(prog, &cubinSize);
+			cubin = new char[cubinSize];
+			nvrtcGetCUBIN(prog, cubin);
+			cout << format("compiled cubin. size: {} byte \n", cubinSize);
+		}
 
 		nvrtcDestroyProgram(&prog);
 
@@ -206,6 +222,7 @@ struct CudaModularProgram{
 		vector<string> modules;
 		vector<string> kernels;
 		vector<string> defines;
+		bool useLTO = true;
 	};
 
 	static void cu_checked(CUresult result){
@@ -305,7 +322,7 @@ struct CudaModularProgram{
 		for(auto modulePath : modulePaths){
 
 			string moduleName = fs::path(modulePath).filename().string();
-			CudaModule* module = new CudaModule(modulePath, moduleName);
+			CudaModule* module = new CudaModule(modulePath, moduleName, args.useLTO);
 			module->defines = args.defines;
 
 			module->compile();
@@ -355,37 +372,44 @@ struct CudaModularProgram{
 		//int arch = 86;
 		string strArch = std::format("-arch=sm_{}", arch);
 
-		vector<const char*> lopts = {
-			"-lto",      // link time optimization
-			strArch.c_str(),
-			// "-time",
-			// "lcudadevrt"
-			// "-verbose",
-			"-O3",           // optimization level
-			"-optimize-unused-variables",
-			"-split-compile=0",
-		};
+		bool anyLTO = false;
+		for(auto module : modules) if(module->useLTO) anyLTO = true;
 
-		nvJitLinkHandle handle;
-		nvJitLinkCreate(&handle, lopts.size(), lopts.data());
+		if(anyLTO){
+			// Full LTO path via nvJitLink
+			vector<const char*> lopts = {
+				"-lto",
+				strArch.c_str(),
+				"-O3",
+				"-optimize-unused-variables",
+				"-split-compile=0",
+			};
 
-		for(auto module : modules){
-			NVJITLINK_SAFE_CALL(handle, nvJitLinkAddData(handle, NVJITLINK_INPUT_LTOIR, (void *)module->ltoir, module->ltoirSize, module->name.c_str()));
+			nvJitLinkHandle handle;
+			nvJitLinkCreate(&handle, lopts.size(), lopts.data());
+
+			for(auto module : modules){
+				NVJITLINK_SAFE_CALL(handle, nvJitLinkAddData(handle, NVJITLINK_INPUT_LTOIR, (void *)module->ltoir, module->ltoirSize, module->name.c_str()));
+			}
+			NVJITLINK_SAFE_CALL(handle, nvJitLinkAddFile(handle, NVJITLINK_INPUT_ANY, CUDA_DEVRTLIB));
+
+			NVJITLINK_SAFE_CALL(handle, nvJitLinkComplete(handle));
+			NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubinSize(handle, &cubinSize));
+
+			if(cubin){ free(cubin); cubin = nullptr; }
+			cubin = malloc(cubinSize);
+			NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubin(handle, cubin));
+			NVJITLINK_SAFE_CALL(handle, nvJitLinkDestroy(&handle));
+
+			cu_checked(cuModuleLoadData(&mod, cubin));
+		} else {
+			// Non-LTO path: NVRTC generated cubin directly — load it straight into CUDA
+			// without any JIT or LTO step. Instantaneous and avoids PTX version issues.
+			for(auto module : modules){
+				cu_checked(cuModuleLoadData(&mod, module->cubin));
+				break; // single-module programs only
+			}
 		}
-		NVJITLINK_SAFE_CALL(handle, nvJitLinkAddFile(handle, NVJITLINK_INPUT_ANY, CUDA_DEVRTLIB));
-
-		NVJITLINK_SAFE_CALL(handle, nvJitLinkComplete(handle));
-		NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubinSize(handle, &cubinSize));
-
-		if(cubin){
-			free(cubin);
-			cubin = nullptr;
-		}
-		cubin = malloc(cubinSize);
-		NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubin(handle, cubin));
-		NVJITLINK_SAFE_CALL(handle, nvJitLinkDestroy(&handle));
-
-		cu_checked(cuModuleLoadData(&mod, cubin));
 
 		{ // Retrieve Kernels
 			uint32_t count = 0;

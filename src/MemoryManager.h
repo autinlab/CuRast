@@ -40,11 +40,36 @@ struct MemoryManager{
 		return memory;
 	}
 
+	// Allocates `size` bytes of GPU memory. Returns 0 if the allocation cannot
+	// safely fit in free VRAM (with ~64 MB headroom for driver overhead) or if
+	// cuMemAlloc itself fails. Callers must check the returned pointer.
 	inline static CUdeviceptr alloc(int64_t size, string label){
-		CUdeviceptr cptr;
+		if(size <= 0) return 0;
 
+		size_t free = 0, total = 0;
+		CUresult info = cuMemGetInfo(&free, &total);
+		if(info == CUDA_SUCCESS){
+			constexpr uint64_t HEADROOM_BYTES = 64ull * 1024ull * 1024ull;
+			if((uint64_t)size + HEADROOM_BYTES > (uint64_t)free){
+				println("MemoryManager::alloc REFUSED '{}': requested {} MB, only {} MB free",
+					label, size >> 20, (uint64_t)free >> 20);
+				return 0;
+			}
+		}
+
+		CUdeviceptr cptr = 0;
 		auto result = cuMemAlloc(&cptr, size);
-		CURuntime::assertCudaSuccess(result);
+		if(result != CUDA_SUCCESS){
+			const char* name = nullptr;
+			const char* desc = nullptr;
+			cuGetErrorName(result, &name);
+			cuGetErrorString(result, &desc);
+			println("MemoryManager::alloc FAILED '{}' ({} MB): {} ({})",
+				label, size >> 20,
+				name ? name : "unknown",
+				desc ? desc : "unknown");
+			return 0;
+		}
 
 		lock_guard<mutex> lock(mtx);
 		Allocation entry = { label, cptr, size};

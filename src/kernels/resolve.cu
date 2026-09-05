@@ -273,6 +273,54 @@ __device__ __forceinline__ float fractf(float x) {
 	return x - floorf(x);
 }
 
+// ── Normal G-buffer (RGBA8) ──────────────────────────────────────────────────
+
+// Pack a unit normal into uint32 RGBA8. Alpha byte = 0xFF marks "valid" so the
+// SSAO can distinguish stored normals from the cleared (= 0) sentinel.
+__device__ inline uint32_t packNormalGBuf(vec3 n){
+	float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+	if(len > 0.0f){ n.x /= len; n.y /= len; n.z /= len; }
+	float fr = n.x * 0.5f + 0.5f; if(fr < 0.0f) fr = 0.0f; if(fr > 1.0f) fr = 1.0f;
+	float fg = n.y * 0.5f + 0.5f; if(fg < 0.0f) fg = 0.0f; if(fg > 1.0f) fg = 1.0f;
+	float fb = n.z * 0.5f + 0.5f; if(fb < 0.0f) fb = 0.0f; if(fb > 1.0f) fb = 1.0f;
+	uint32_t r = (uint32_t)(fr * 255.0f + 0.5f);
+	uint32_t g = (uint32_t)(fg * 255.0f + 0.5f);
+	uint32_t b = (uint32_t)(fb * 255.0f + 0.5f);
+	return r | (g << 8) | (b << 16) | 0xFF000000u;
+}
+
+// Unpack a normal previously stored with packNormalGBuf. Returns vec3(0) if the
+// pixel was cleared (alpha == 0).
+__device__ inline vec3 unpackNormalGBuf(uint32_t v){
+	if((v >> 24) == 0u) return vec3(0.0f, 0.0f, 0.0f); // sentinel
+	float r = float(v        & 0xff) / 255.0f * 2.0f - 1.0f;
+	float g = float((v >> 8) & 0xff) / 255.0f * 2.0f - 1.0f;
+	float b = float((v >> 16)& 0xff) / 255.0f * 2.0f - 1.0f;
+	return vec3(r, g, b);
+}
+
+// Convert a world-space surface normal to the SSAO's "+Z forward / depth = +Z"
+// view space. Use a vec4 with w=0 to apply only the rotation part of the view
+// matrix (avoids needing mat3(mat4) which is not always available under
+// GLM_FORCE_CUDA). Standard view (camera looks toward -Z) needs a Z-flip to align.
+//
+// IMPORTANT: under GLM_FORCE_CUDA the 4-float vec4 constructor `vec4(x, y, z, w)`
+// generates code that segfaults during sphere shading on this build. Using the
+// vec3+float and vec4-to-vec3 conversion forms (which the working code in this
+// file already uses) avoids it.
+__device__ inline vec3 worldNormalToSsaoView(vec3 N_world){
+	vec4 N_view4 = c_target.view * vec4(N_world, 0.0f);
+	float nx = N_view4.x;
+	float ny = N_view4.y;
+	float nz = -N_view4.z; // flip Z to SSAO convention (+Z forward)
+	if(nz > 0.0f){ nx = -nx; ny = -ny; nz = -nz; }
+	float len = sqrtf(nx*nx + ny*ny + nz*nz);
+	if(len > 0.0f){ float inv = 1.0f / len; nx *= inv; ny *= inv; nz *= inv; }
+	vec3 out;
+	out.x = nx; out.y = ny; out.z = nz;
+	return out;
+}
+
 // ── SSAO Helpers ─────────────────────────────────────────────────────────────
 
 // Reconstruct view-space position from screen pixel + linear depth.
@@ -347,33 +395,54 @@ __device__ vec3 ssao_normal(int x, int y, float d0, uint64_t* cb, int w, int h) 
 // S is above the surface in 3D.  The tangent-plane reference (expected_z) gives
 // the depth the *current* surface should have at each sample location; only
 // geometry that protrudes above that plane counts as a real occluder.
+// Multiscale variant: runs the same scale-agnostic hemisphere SSAO at multiple
+// `radius_fraction` levels and combines via max(occlusion) so the strongest cue
+// at any scale wins. This catches both fine cavities (small radius) and overall
+// enclosure / skylight blocking (large radius), which is what makes large
+// molecular assemblies read as solid rather than a mist of dots.
+//
+// `radius_fractions[k]` is the level's world radius expressed as a fraction of
+// the centre pixel's depth (so screen-space footprint is depth-independent).
+// `bias_factors[k]` is a per-level intensity multiplier.
+// `samples_per_level` is sample count per level; total work scales linearly.
 __device__ float getSSAOShadingFactor(
 	uint64_t* colorbuffer,
+	uint32_t* normalbuffer,
 	float     center_depth,
 	int x, int y,
 	int width, int height,
-	float /* focal_length — kept for API compatibility; use c_target.proj directly */
+	float /* focal_length — kept for API compatibility; use c_target.proj directly */,
+	const float* radius_fractions,
+	const float* bias_factors,
+	int   num_levels,
+	int   samples_per_level,
+	float intensity
 ) {
 	if (isinf(center_depth) || center_depth <= 0.0f) return 1.0f;
 
-	// ── Tuning ──────────────────────────────────────────────────────────────
-	const int   NUM_SAMPLES     = 32;
-	const float RADIUS_FRACTION = 0.2025f; // world radius = 2.5 % of depth
-	const float INTENSITY       = 1.1f;
-	const float RANGE_MUL       = 2.5f;  // reject occluders farther than RANGE_MUL * radius
-	const float BIAS_FRACTION   = 0.05f; // bias = BIAS_FRACTION * world_radius
-	// ────────────────────────────────────────────────────────────────────────
+	const float RANGE_MUL     = 2.5f;
+	const float BIAS_FRACTION = 0.05f;
 
-	float world_radius = center_depth * RADIUS_FRACTION;
-	float bias         = BIAS_FRACTION * world_radius;
-
-	// Reconstruct view-space geometry at the center pixel
+	// Reconstruct view-space geometry at the center pixel.
 	vec3 P = ssao_viewPos(float(x), float(y), center_depth, width, height);
-	vec3 N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
+
+	// Prefer the analytic normal stashed by the resolve pass — for sphere imposters
+	// the depth-gradient reconstruction below is unreliable in dense clusters where
+	// every pixel sits near a silhouette edge. Fall back to depth gradients only
+	// when the normal G-buffer has no entry (e.g. triangle-only pixels).
+	vec3 N;
+	if(normalbuffer != nullptr){
+		uint32_t packed = normalbuffer[y * width + x];
+		if((packed >> 24) != 0u){
+			N = unpackNormalGBuf(packed);
+		} else {
+			N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
+		}
+	} else {
+		N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
+	}
 
 	// Screen-space depth gradients for the tangent-plane reference.
-	// Edge-aware: pick the side with the smaller depth jump to avoid warping
-	// across silhouettes.
 	auto getDepth = [&](int nx, int ny) -> float {
 		nx = clamp(nx, 0, width  - 1);
 		ny = clamp(ny, 0, height - 1);
@@ -394,58 +463,65 @@ __device__ float getSSAOShadingFactor(
 	// Per-pixel decorrelation — integer hash avoids the banding of smooth spatial functions
 	uint32_t h = uint32_t(x) * 2246822519u ^ uint32_t(y) * 3266489917u;
 	h ^= h >> 13; h *= 0xbf58476du; h ^= h >> 31;
-	float rand_angle = float(h >> 8) * (6.28318530f / float(1 << 24));
+	float rand_angle_base = float(h >> 8) * (6.28318530f / float(1 << 24));
 
-	float occlusion          = 0.0f;
-	const float INV_N        = 1.0f / float(NUM_SAMPLES);
 	const float GOLDEN_ANGLE = 2.39996323f;
+	const float INV_N        = 1.0f / float(samples_per_level);
 
-	for (int i = 0; i < NUM_SAMPLES; ++i) {
-		// Cosine-weighted hemisphere sample via golden spiral.
-		// Mapping fi → sin²(θ) gives cosine-weighted elevation distribution.
-		float fi        = (float(i) + 0.5f) * INV_N;
-		float sin_theta = sqrtf(fi);
-		float cos_theta = sqrtf(1.0f - fi);
-		float phi       = float(i) * GOLDEN_ANGLE + rand_angle;
+	float best_occlusion = 0.0f;
 
-		// Sample direction in view space (hemisphere oriented around N)
-		vec3 dir = T * (sin_theta * cosf(phi))
-		         + B * (sin_theta * sinf(phi))
-		         + N *  cos_theta;
+	if(num_levels < 1) num_levels = 1;
+	if(num_levels > 4) num_levels = 4;
 
-		// Distribute samples at increasing radii (sqrt → uniform area coverage)
-		float r = world_radius * sqrtf(float(i + 1) * INV_N);
-		// r = pow(r, 1.7f);
-		vec3 S  = P + dir * r;   // sample point in view space
+	for(int level = 0; level < num_levels; level++){
+		float radius_fraction = radius_fractions[level];
+		float bias_factor     = bias_factors[level];
+		float world_radius    = center_depth * radius_fraction;
+		float bias            = BIAS_FRACTION * world_radius;
+		// Decorrelate the sample direction across levels so they don't all probe
+		// the exact same ray pattern (rotating phi by pi / numLevels per level).
+		float rand_angle      = rand_angle_base + float(level) * (3.14159265f / float(num_levels));
 
-		if (S.z <= 0.001f) continue;   // behind camera
+		float occlusion = 0.0f;
 
-		// Reproject the sample and read the actual scene depth at that pixel
-		vec2 sp = ssao_screenPos(S, width, height);
-		int  sx = clamp(int(sp.x), 0, width  - 1);
-		int  sy = clamp(int(sp.y), 0, height - 1);
+		for (int i = 0; i < samples_per_level; ++i) {
+			float fi        = (float(i) + 0.5f) * INV_N;
+			float sin_theta = sqrtf(fi);
+			float cos_theta = sqrtf(1.0f - fi);
+			float phi       = float(i) * GOLDEN_ANGLE + rand_angle;
 
-		float actual_depth = __uint_as_float(colorbuffer[sy * width + sx] >> 32);
-		if (isinf(actual_depth)) continue;   // sky / background
+			vec3 dir = T * (sin_theta * cosf(phi))
+			         + B * (sin_theta * sinf(phi))
+			         + N *  cos_theta;
 
-		// Tangent-plane reference: the depth the current surface is expected to
-		// have at (sx, sy) if it were smooth.  Comparing actual_depth against
-		// this — rather than against S.z — prevents the surface from occluding
-		// itself on steep triangles where depth changes rapidly across pixels.
-		float dx = sp.x - float(x);
-		float dy = sp.y - float(y);
-		float expected_z = center_depth + dz_dx * dx + dz_dy * dy;
+			float r = world_radius * sqrtf(float(i + 1) * INV_N);
+			vec3 S  = P + dir * r;
 
-		// Positive dz means geometry protrudes above the tangent plane → real occluder
-		float dz = expected_z - actual_depth;
+			if (S.z <= 0.001f) continue;
 
-		if (dz > bias && dz < world_radius * RANGE_MUL) {
-			float range_falloff = 1.0f - dz / (world_radius * RANGE_MUL);
-			occlusion += range_falloff * cos_theta;   // cosine-weighted contribution
+			vec2 sp = ssao_screenPos(S, width, height);
+			int  sx = clamp(int(sp.x), 0, width  - 1);
+			int  sy = clamp(int(sp.y), 0, height - 1);
+
+			float actual_depth = __uint_as_float(colorbuffer[sy * width + sx] >> 32);
+			if (isinf(actual_depth)) continue;
+
+			float dx_p = sp.x - float(x);
+			float dy_p = sp.y - float(y);
+			float expected_z = center_depth + dz_dx * dx_p + dz_dy * dy_p;
+			float dz = expected_z - actual_depth;
+
+			if (dz > bias && dz < world_radius * RANGE_MUL) {
+				float range_falloff = 1.0f - dz / (world_radius * RANGE_MUL);
+				occlusion += range_falloff * cos_theta;
+			}
 		}
+
+		occlusion *= INV_N * bias_factor;
+		if(occlusion > best_occlusion) best_occlusion = occlusion;
 	}
 
-	return clamp(1.0f - occlusion * INV_N * INTENSITY, 0.0f, 1.0f);
+	return clamp(1.0f - best_occlusion * intensity, 0.0f, 1.0f);
 }
 
 extern "C" __global__
@@ -548,7 +624,13 @@ void kernel_enlarge(
 extern "C" __global__
 void kernel_ssaoOcclusion(
 	uint64_t* occlusionBuffer,
-	float* ssaoShadeBuffer
+	float* ssaoShadeBuffer,
+	uint32_t* normalbuffer,
+	float radius_l0, float radius_l1, float radius_l2, float radius_l3,
+	float bias_l0,   float bias_l1,   float bias_l2,   float bias_l3,
+	int   num_levels,
+	int   samples_per_level,
+	float intensity
 ){
 	auto grid = cg::this_grid();
 	int x = grid.thread_index().x;
@@ -560,7 +642,15 @@ void kernel_ssaoOcclusion(
 	uint64_t pixel = c_target.colorbuffer[pixelID];
 	float depth = __uint_as_float(pixel >> 32);
 	float focal_length = c_target.proj[1][1];
-	float ssao = getSSAOShadingFactor(c_target.colorbuffer, depth, x, y, c_target.width, c_target.height, focal_length);
+
+	float radii[4]  = { radius_l0, radius_l1, radius_l2, radius_l3 };
+	float biases[4] = { bias_l0,   bias_l1,   bias_l2,   bias_l3   };
+
+	float ssao = getSSAOShadingFactor(
+		c_target.colorbuffer, normalbuffer, depth, x, y,
+		c_target.width, c_target.height, focal_length,
+		radii, biases, num_levels, samples_per_level, intensity
+	);
 
 	uint64_t occ = uint64_t(__float_as_uint(depth)) << 32 | uint64_t(__float_as_uint(ssao));
 
@@ -597,8 +687,10 @@ void kernel_ssaoBlur(
 	const float gaussian[7] = { 0.015625f, 0.09375f, 0.234375f, 0.3125f, 0.234375f, 0.09375f, 0.015625f };
 
 	// Depth-relative bilateral sigma: keeps edges sharp regardless of viewing distance.
-	// 0.002 was too tight (rejects all neighbors), 0.02 gives smooth blending.
-	const float DEPTH_SIGMA = center_depth * 0.2f;
+	// Tuned so neighbours within ~1% of the centre's depth are accepted (smooths the
+	// AO term across a single curved sphere) while inter-atom depth jumps are rejected
+	// (prevents the AO from bleeding across silhouette edges).
+	const float DEPTH_SIGMA = fmaxf(center_depth * 0.01f, 1e-3f);
 	const float inv2sigma2  = 1.0f / (2.0f * DEPTH_SIGMA * DEPTH_SIGMA);
 
 	float sum         = 0.0f;
@@ -615,9 +707,12 @@ void kernel_ssaoBlur(
 		float sample_depth     = __uint_as_float(occ >> 32);
 		float sample_occlusion = __uint_as_float(occ & 0xffffffff);
 
+		// Background neighbours skipped — they have no real occlusion contribution
+		// and would drag the centre pixel toward 1.0 across silhouettes.
+		if(isinf(sample_depth)) continue;
+
 		float depth_diff   = sample_depth - center_depth;
 		float depth_weight = expf(-depth_diff * depth_diff * inv2sigma2);
-		depth_weight = 1.0f;
 
 		float w = gaussian[dx + RADIUS] * gaussian[dy + RADIUS] * depth_weight;
 
@@ -646,7 +741,9 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	int mouseY,
 	DeviceState* state,
 	RasterizationSettings rasterizationSettings,
-	JpegPipeline jpp
+	JpegPipeline jpp,
+	SphereRasterArgs sphereArgs,
+	uint32_t* normalbuffer
 ) {
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -1130,6 +1227,91 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	// }
 
 	
+
+	// Sphere composite — check if a sphere is closer than the triangle
+	if(sphereArgs.sphere_framebuffer != nullptr && sphereArgs.numSpheres > 0) {
+		uint64_t sphere_val = sphereArgs.sphere_framebuffer[pixelID];
+		if(sphere_val != 0xFFFFFFFFFFFFFFFFull) {
+			uint32_t sphere_idx = (uint32_t)(sphere_val & 0xFFFFFFFFull) - 1;
+
+			vec3 center_world = sphereArgs.positions[sphere_idx];
+			float radius      = sphereArgs.radii[sphere_idx];
+
+			// Mirror the LOD scaling used by the rasterizer so the ray-sphere
+			// intersection covers the same painted footprint. Without this, pixels
+			// inside the LOD-enlarged disc but outside the original radius would
+			// miss the geometric sphere and fall through to the sub-pixel fallback.
+			if(sphereArgs.lod.numLevels > 0) {
+				float dist = length(c_target.cameraPos - center_world);
+				radius = sphereLodScaledRadius(sphereArgs.lod, sphere_idx, radius, dist);
+			}
+
+			vec3 oc  = origin - center_world;
+			float b  = dot(oc, rayDir);
+			float cq = dot(oc, oc) - radius * radius;
+			float disc = b * b - cq;
+
+			float sphere_depth;
+			vec3  N;
+			bool  shade_sphere = false;
+
+			if(disc >= 0.0f) {
+				float t = -b - sqrtf(disc);
+				if(t > 0.0f) {
+					vec3 hit_world = origin + t * rayDir;
+					vec4 hit_view  = c_target.view * vec4(hit_world, 1.0f);
+					sphere_depth = -hit_view.z;
+					N = normalize(hit_world - center_world);
+					shade_sphere = true;
+				}
+			}
+			if(!shade_sphere) {
+				// Sub-pixel atom: the visbuffer placed this sphere here
+				// even though the ray misses the (tiny) sphere geometry.
+				// Fall back to visbuffer depth + camera-facing normal.
+				sphere_depth = __uint_as_float((uint32_t)(sphere_val >> 32));
+				N = -rayDir;
+				shade_sphere = true;
+			}
+
+			if(shade_sphere && sphere_depth < depth) {
+				vec3 L = normalize(vec3{1.0f, 1.0f, 1.0f});
+				float d = max(dot(N, L), 0.0f);
+				float shade = d * 0.7f + 0.5f;
+
+				// Two color paths. Element coloring (default theme) is the
+				// 1-byte-per-atom + 256-entry palette path — saves 4× the GPU
+				// memory of the legacy uint32 buffer. Chain/entity themes still
+				// use the per-atom uint32 buffer because their key spaces don't
+				// fit in a uint8.
+				uint32_t base;
+				if(sphereArgs.atomTypes != nullptr && sphereArgs.colorPalette != nullptr){
+					base = sphereArgs.colorPalette[sphereArgs.atomTypes[sphere_idx]];
+				}else if(sphereArgs.colors != nullptr){
+					base = sphereArgs.colors[sphere_idx];
+				}else{
+					base = 0xFFFFFFFFu;
+				}
+				uint8_t* bi = (uint8_t*)&base;
+				uint32_t sphere_color = 0xff000000;
+				uint8_t* bo = (uint8_t*)&sphere_color;
+				bo[0] = (uint8_t)clamp(shade * float(bi[0]), 0.0f, 255.0f);
+				bo[1] = (uint8_t)clamp(shade * float(bi[1]), 0.0f, 255.0f);
+				bo[2] = (uint8_t)clamp(shade * float(bi[2]), 0.0f, 255.0f);
+
+				color = sphere_color;
+				depth = sphere_depth;
+
+				// Stash the analytic sphere normal (in SSAO view space) for the AO
+				// pass. This is the dominant fix for "splotchy" AO on dense sphere
+				// scenes — depth-gradient reconstruction only works on smooth
+				// surfaces and breaks at every silhouette edge.
+				if(normalbuffer != nullptr){
+					normalbuffer[pixelID] = packNormalGBuf(worldNormalToSsaoView(N));
+				}
+			}
+		}
+	}
 
 	if(depth != Infinity){
 		uint64_t udepth = __float_as_uint(depth);

@@ -30,6 +30,7 @@
 #include "GLTFLoader.h"
 #include "LargeGlbLoader.h"
 #include "PlyLoader.h"
+#include "mmcif/MMCIFLoader.h"
 
 using namespace std; // YOLO
 
@@ -300,6 +301,32 @@ void initScene() {
 
 void update(){
 
+	// Finalise any completed async mmCIF load: integrate into the scene & frame
+	// the camera. The worker thread parses + uploads to GPU; only the scene
+	// mutation and camera reset have to happen on the main thread.
+	if(mmcif::activeLoad){
+		int stage = mmcif::activeLoad->stage.load(std::memory_order_acquire);
+		if(stage == mmcif::LoadingProgress::DONE){
+			auto loaded = mmcif::activeLoad->result;
+			if(loaded){
+				Scene& scene = CuRast::instance->scene;
+				scene.world->children.push_back(loaded->node);
+				mmcif::loadedAll.push_back(loaded);
+				CuRastSettings::showBenchmarking = true; // open the replication slider
+
+				scene.updateTransformations();
+
+				Runtime::controls->yaw    = -7.204;
+				Runtime::controls->pitch  = -0.579;
+				Runtime::controls->radius = loaded->radius * 2.5f;
+				Runtime::controls->target = { loaded->centroid.x, loaded->centroid.y, loaded->centroid.z };
+			}
+			mmcif::activeLoad.reset();
+		} else if(stage == mmcif::LoadingProgress::FAILED){
+			mmcif::activeLoad.reset();
+		}
+	}
+
 	if(Benchmarking::request_scenario){
 
 		auto scenario = Benchmarking::request_scenario;
@@ -379,6 +406,21 @@ void update(){
 
 int main(int argc, char** argv){
 
+	// Find project root: walk up from the executable until we find ./src/kernels.
+	// Lets the app launch from anywhere (e.g. double-click in build\Release).
+	{
+		fs::path exeDir = fs::path(argv[0]).parent_path();
+		fs::path probe = fs::absolute(exeDir);
+		for(int i = 0; i < 8; i++){
+			if(fs::exists(probe / "src" / "kernels")){
+				fs::current_path(probe);
+				break;
+			}
+			if(!probe.has_parent_path() || probe == probe.parent_path()) break;
+			probe = probe.parent_path();
+		}
+	}
+
 	Benchmarking::datasetPath = "./";
 
 	for(int i = 1; i < argc - 1; i++){
@@ -424,9 +466,32 @@ int main(int argc, char** argv){
 			Runtime::controls->target = { center.x, center.y, center.z};
 		}
 
+		if(iEndsWith(file, ".cif") || iEndsWith(file, ".mmcif")) {
+			// Skip if a load is already running — finalisation happens in update().
+			int activeStage = mmcif::activeLoad
+				? mmcif::activeLoad->stage.load(std::memory_order_acquire)
+				: (int)mmcif::LoadingProgress::IDLE;
+			bool inFlight = mmcif::activeLoad
+				&& activeStage != mmcif::LoadingProgress::DONE
+				&& activeStage != mmcif::LoadingProgress::FAILED;
+			if(!inFlight){
+				mmcif::activeLoad = mmcif::loadAsync(file, context);
+			}
+		}
+
 	});
 
 	initScene();
+
+	// Auto-load file passed as last command-line argument
+	if(argc >= 2) {
+		string autoFile = argv[argc - 1];
+		if(iEndsWith(autoFile, ".cif") || iEndsWith(autoFile, ".mmcif") ||
+		   iEndsWith(autoFile, ".glb") || iEndsWith(autoFile, ".gltf")) {
+			for(auto& listener : VKRenderer::fileDropListeners)
+				listener({autoFile});
+		}
+	}
 
 	VKRenderer::loop(
 		[&]() {

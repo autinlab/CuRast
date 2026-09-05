@@ -9,8 +9,16 @@
 
 using namespace std;
 
-CudaVirtualMemory* cvm_framebuffer = nullptr;
-CudaVirtualMemory* cvm_colorbuffer = nullptr;
+CudaVirtualMemory* cvm_framebuffer        = nullptr;
+CudaVirtualMemory* cvm_colorbuffer        = nullptr;
+CudaVirtualMemory* cvm_sphere_framebuffer = nullptr;
+// Per-pixel normal G-buffer. uint32 RGBA8: bytes 0..2 = (n.x, n.y, n.z) mapped from
+// [-1,1] to [0,255], byte 3 = 0xFF when valid / 0x00 sentinel when no surface.
+// Used by SSAO instead of reconstructing the normal from depth gradients, which
+// is unreliable on dense sphere-imposter scenes where every pixel sits near a
+// silhouette edge.
+CudaVirtualMemory* cvm_normalbuffer       = nullptr;
+CudaModularProgram* sphereProg            = nullptr;
 bool initialized = false;
 JpegTextures* jpegTextures = nullptr;
 
@@ -114,7 +122,8 @@ void drawTrianglesVisbuffer(
 	static CUdeviceptr cptr_numProcessedHugeTriangles       = MemoryManager::alloc(4, "cptr_numProcessedHugeTriangles");
 	
 	static CudaModularProgram* prog = new CudaModularProgram({
-		.modules = {"./src/kernels/triangles_visbuffer.cu",}
+		.modules = {"./src/kernels/triangles_visbuffer.cu",},
+		.useLTO  = false,
 	});
 
 	if(instances.size() == 0) return;
@@ -367,7 +376,10 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		vector<shared_ptr<VKTexture>> attachments = {view.framebuffer->colorAttachment};
 		auto mappings = mapCudaVk(attachments);
 
-		static CudaModularProgram* prog = new CudaModularProgram({"./src/kernels/resolve.cu",});
+		static CudaModularProgram* prog = new CudaModularProgram(CudaModularProgram::CudaModularProgramArgs{
+			.modules = {"./src/kernels/resolve.cu",},
+			.useLTO  = false,
+		});
 		// memcpy arguments to constant buffer
 		CUdeviceptr cptr_target = prog->getGlobalsPointer("c_target");
 		cuMemcpyHtoDAsync(cptr_target, &target, sizeof(target), 0);
@@ -384,6 +396,11 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			uint64_t requiredBytes = numPixels * 8;
 			cvm_framebuffer->commit(requiredBytes);
 			cvm_colorbuffer->commit(requiredBytes);
+			cvm_sphere_framebuffer->commit(requiredBytes);
+			cvm_normalbuffer->commit((size_t)numPixels * 4);
+			// Sentinel-clear: 0 in alpha byte = "no normal stored at this pixel" so SSAO
+			// can fall back to depth-based reconstruction for triangle-only pixels.
+			cuMemsetD8Async(cvm_normalbuffer->cptr, 0x00, (size_t)numPixels * 4, 0);
 
 			prog->launch("kernel_clearFramebuffer", {
 				&cvm_framebuffer->cptr,
@@ -398,15 +415,136 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&clearColor,
 				&clearDepth
 			}, numPixels);
+
+			// Fill sphere framebuffer with 0xFF = sentinel (0xFFFFFFFFFFFFFFFF = no sphere)
+			cuMemsetD8Async(cvm_sphere_framebuffer->cptr, 0xFF, (size_t)numPixels * 8, 0);
 		}
 
 		drawTrianglesVisbuffer(
-			scene, view, meshes_unique, meshes_allInstances, 
-			cvm_meshes->cptr, 
+			scene, view, meshes_unique, meshes_allInstances,
+			cvm_meshes->cptr,
 			cvm_instances->cptr, cvm_transforms->cptr, cvm_triangleCountPrefixsum->cptr,
 			target, mappings
 		);
-		
+
+		// Per-frame LOD config scaled to the current scene size. The default config
+		// in CuRastSettings stores normalised min/max/overlap; here we multiply by
+		// `sceneScale` (the orbit radius — a good proxy for the molecule's extent)
+		// so the bands track the camera's working distance regardless of structure
+		// size. Built once per frame and reused by both the rasterizer and the
+		// resolve sphere composite (so ray-sphere shading uses the same scaled radius).
+		SphereLodConfig frameLod{};
+		if(CuRastSettings::enableSphereLOD){
+			const SphereLodConfig& base = CuRastSettings::sphereLodConfig;
+			float sceneScale = (float)Runtime::controls->radius;
+			if(sceneScale <= 0.0f) sceneScale = 1.0f;
+			frameLod.numLevels = base.numLevels;
+			for(int k = 0; k < MAX_SPHERE_LOD_LEVELS; k++){
+				frameLod.levels[k] = base.levels[k];
+				frameLod.levels[k].minDist *= sceneScale;
+				frameLod.levels[k].maxDist *= sceneScale;
+				frameLod.levels[k].overlap *= sceneScale;
+			}
+		}
+
+		{ // DRAW SPHERES (sphere imposter visbuffer)
+			// Upload c_target constant to the sphere program
+			CUdeviceptr cptr_sphere_target = sphereProg->getGlobalsPointer("c_target");
+			cuMemcpyHtoDAsync(cptr_sphere_target, &target, sizeof(target), 0);
+
+			vector<SNSpheres*> sphereNodes;
+			scene->forEach<SNSpheres>([&](SNSpheres* node){ sphereNodes.push_back(node); });
+
+			// Determine which LOD levels are active for the current camera distance.
+			// We dispatch one kernel call per active level with thread count =
+			// numSpheres / stride, so distant frames touch ~stride× less memory.
+			float cameraDist = (float)Runtime::controls->radius;
+			int   activeLevels[MAX_SPHERE_LOD_LEVELS];
+			int   numActive = 0;
+			if(frameLod.numLevels > 0){
+				for(int k = 0; k < frameLod.numLevels; k++){
+					const SphereLodLevel& L = frameLod.levels[k];
+					if(cameraDist >= L.minDist && cameraDist <= L.maxDist){
+						activeLevels[numActive++] = k;
+					}
+				}
+				// Safety: if camera is outside every band (e.g. very close zoom or extreme far),
+				// fall back to the band whose centre is nearest the camera so we still draw
+				// *something*.
+				if(numActive == 0){
+					int   bestK   = 0;
+					float bestDsq = 1e30f;
+					for(int k = 0; k < frameLod.numLevels; k++){
+						float c = 0.5f * (frameLod.levels[k].minDist + frameLod.levels[k].maxDist);
+						float d = (cameraDist - c); d *= d;
+						if(d < bestDsq){ bestDsq = d; bestK = k; }
+					}
+					activeLevels[numActive++] = bestK;
+				}
+			}
+
+			for(auto sn : sphereNodes) {
+				if(sn->numSpheres == 0) continue;
+
+				if(!CuRastSettings::enableSphereLOD || frameLod.numLevels == 0){
+					SphereRasterArgs sArgs;
+					sArgs.positions         = (vec3*)sn->cptr_positions;
+					sArgs.radii             = (float*)sn->cptr_radii;
+					sArgs.colors            = (uint32_t*)sn->cptr_colors;
+					sArgs.atomTypes         = (uint8_t*)sn->cptr_atomTypes;
+					sArgs.colorPalette      = (uint32_t*)sn->cptr_palette;
+					sArgs.numSpheres        = sn->numSpheres;
+					sArgs.sphere_framebuffer = (uint64_t*)cvm_sphere_framebuffer->cptr;
+					sArgs.lod               = {};
+					sArgs.activeLevel       = -1;
+					sArgs.dispatchStride    = 1;
+					sArgs.skipStride        = 0;
+					sArgs.skipMinDist       = 0.0f;
+					sArgs.skipMaxDist       = 0.0f;
+					sphereProg->launch("kernel_draw_spheres", {&sArgs}, sn->numSpheres);
+					continue;
+				}
+
+				// activeLevels is in level-index order (level 0 finest first). For each
+				// active level we identify the *next coarser active level* and pass its
+				// stride + distance band so the kernel can skip atoms that the coarser
+				// dispatch will already render. Without this each atom is drawn once
+				// per active level → doughnut artifact at level boundaries.
+				for(int idx = 0; idx < numActive; idx++){
+					int k = activeLevels[idx];
+					int stride = frameLod.levels[k].stride;
+					if(stride < 1) stride = 1;
+
+					int   skipStride  = 0;
+					float skipMinDist = 0.0f;
+					float skipMaxDist = 0.0f;
+					if(idx + 1 < numActive){
+						int kNextCoarser = activeLevels[idx + 1];
+						skipStride  = frameLod.levels[kNextCoarser].stride;
+						skipMinDist = frameLod.levels[kNextCoarser].minDist;
+						skipMaxDist = frameLod.levels[kNextCoarser].maxDist;
+					}
+
+					SphereRasterArgs sArgs;
+					sArgs.positions         = (vec3*)sn->cptr_positions;
+					sArgs.radii             = (float*)sn->cptr_radii;
+					sArgs.colors            = (uint32_t*)sn->cptr_colors;
+					sArgs.atomTypes         = (uint8_t*)sn->cptr_atomTypes;
+					sArgs.colorPalette      = (uint32_t*)sn->cptr_palette;
+					sArgs.numSpheres        = sn->numSpheres;
+					sArgs.sphere_framebuffer = (uint64_t*)cvm_sphere_framebuffer->cptr;
+					sArgs.lod               = frameLod;
+					sArgs.activeLevel       = k;
+					sArgs.dispatchStride    = stride;
+					sArgs.skipStride        = skipStride;
+					sArgs.skipMinDist       = skipMinDist;
+					sArgs.skipMaxDist       = skipMaxDist;
+
+					int dispatchN = (sn->numSpheres + stride - 1) / stride;
+					sphereProg->launch("kernel_draw_spheres", {&sArgs}, dispatchN);
+				}
+			}
+		}
 
 		// DRAW BOUNDING BOXES
 		if(CuRastSettings::showBoundingBoxes){
@@ -467,6 +605,31 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 
 		{ // RESOLVE VISIBILITY BUFFER (write colors to colorbuffer)
+			// Build sphere args for the resolve kernel (composite sphere over triangles)
+			SphereRasterArgs sphereResolveArgs;
+			sphereResolveArgs.sphere_framebuffer = (uint64_t*)cvm_sphere_framebuffer->cptr;
+			sphereResolveArgs.numSpheres         = 0;
+			sphereResolveArgs.positions          = nullptr;
+			sphereResolveArgs.radii              = nullptr;
+			sphereResolveArgs.colors             = nullptr;
+			sphereResolveArgs.atomTypes          = nullptr;
+			sphereResolveArgs.colorPalette       = nullptr;
+			sphereResolveArgs.lod                = frameLod;
+
+			// Collect all sphere geometry pointers for resolve-time raycast
+			// We use the first SNSpheres node for the resolve pass (multi-batch handled by the visbuffer sphereIdx encoding)
+			// For multi-node support the sphere arrays would need to be concatenated; for now one node is the common case.
+			scene->forEach<SNSpheres>([&](SNSpheres* node){
+				if(node->numSpheres > 0 && sphereResolveArgs.numSpheres == 0) {
+					sphereResolveArgs.positions    = (vec3*)node->cptr_positions;
+					sphereResolveArgs.radii        = (float*)node->cptr_radii;
+					sphereResolveArgs.colors       = (uint32_t*)node->cptr_colors;
+					sphereResolveArgs.atomTypes    = (uint8_t*)node->cptr_atomTypes;
+					sphereResolveArgs.colorPalette = (uint32_t*)node->cptr_palette;
+					sphereResolveArgs.numSpheres   = node->numSpheres;
+				}
+			});
+
 			void* args[] = {
 				&cvm_instances->cptr,
 				&numInstances,
@@ -476,6 +639,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&cptr_state,
 				&rasterSettings,
 				&jpp,
+				&sphereResolveArgs,
+				&cvm_normalbuffer->cptr,
 			};
 			prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D", args, target.width, target.height);
 		}
@@ -598,12 +763,51 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			// But for the final ssao shading values, we need an extra buffer
 			cvm_ssaoShadebuffer->commit(cvm_framebuffer->comitted / 2);
 
+			// Multiscale SSAO parameters: per-level radius (as fraction of view-space depth)
+			// and per-level bias factor. When enableMultiscaleSSAO is off we still use the
+			// kernel's level-loop, but with one level at the original 0.2025 radius.
+			// All radii are multiplied by the global ssaoRadiusScale so the user can retune
+			// for any scene with a single slider.
+			float r0, r1, r2, r3, b0, b1, b2, b3;
+			int   numLevels;
+			float scl = CuRastSettings::ssaoRadiusScale;
+			if(CuRastSettings::enableMultiscaleSSAO){
+				r0 = CuRastSettings::ssaoLevelRadius[0] * scl;
+				r1 = CuRastSettings::ssaoLevelRadius[1] * scl;
+				r2 = CuRastSettings::ssaoLevelRadius[2] * scl;
+				r3 = CuRastSettings::ssaoLevelRadius[3] * scl;
+				b0 = CuRastSettings::ssaoLevelBias[0];
+				b1 = CuRastSettings::ssaoLevelBias[1];
+				b2 = CuRastSettings::ssaoLevelBias[2];
+				b3 = CuRastSettings::ssaoLevelBias[3];
+				numLevels = CuRastSettings::ssaoLevels;
+			} else {
+				// Single-scale: take the user's level-0 radius so the tuning slider works.
+				r0 = CuRastSettings::ssaoLevelRadius[0] * scl;
+				r1 = r2 = r3 = 0.0f;
+				b0 = CuRastSettings::ssaoLevelBias[0];
+				b1 = b2 = b3 = 0.0f;
+				numLevels = 1;
+			}
+			int   samplesPerLevel = CuRastSettings::ssaoSamplesPerLevel;
+			float intensity       = CuRastSettings::ssaoIntensity;
+
 			void* argsSSAO[] = {
+				&cvm_framebuffer->cptr,
+				&cvm_ssaoShadebuffer->cptr,
+				&cvm_normalbuffer->cptr,
+				&r0, &r1, &r2, &r3,
+				&b0, &b1, &b2, &b3,
+				&numLevels,
+				&samplesPerLevel,
+				&intensity,
+			};
+			void* argsBlur[] = {
 				&cvm_framebuffer->cptr,
 				&cvm_ssaoShadebuffer->cptr
 			};
 			prog->launch2D("kernel_ssaoOcclusion", argsSSAO, target.width, target.height);
-			prog->launch2D("kernel_ssaoBlur", argsSSAO, target.width, target.height);
+			prog->launch2D("kernel_ssaoBlur", argsBlur, target.width, target.height);
 		}
 
 		// static CUdeviceptr cptr_enlarged = CURuntime::alloc("enlarge", 4096 * 4096 * 8);
@@ -668,6 +872,17 @@ void initialize(){
 
 	cvm_colorbuffer = MemoryManager::allocVirtualCuda(virtualCapacity, "colorbuffer");
 	cvm_colorbuffer->commit(8 * defaultPixels);
+
+	cvm_sphere_framebuffer = MemoryManager::allocVirtualCuda(virtualCapacity, "sphere_framebuffer");
+	cvm_sphere_framebuffer->commit(8 * defaultPixels);
+
+	cvm_normalbuffer = MemoryManager::allocVirtualCuda(virtualCapacity, "normalbuffer");
+	cvm_normalbuffer->commit(4 * defaultPixels);
+
+	sphereProg = new CudaModularProgram(CudaModularProgram::CudaModularProgramArgs{
+		.modules = {"./src/kernels/spheres_visbuffer.cu"},
+		.useLTO  = false,
+	});
 
 	jpegTextures = new JpegTextures();
 
