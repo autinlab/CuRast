@@ -415,7 +415,7 @@ __device__ float getSSAOShadingFactor(
 	const float* radius_fractions,
 	const float* bias_factors,
 	int   num_levels,
-	int   samples_per_level,
+	const int* samples_per_level,
 	float intensity
 ) {
 	if (isinf(center_depth) || center_depth <= 0.0f) return 1.0f;
@@ -466,7 +466,6 @@ __device__ float getSSAOShadingFactor(
 	float rand_angle_base = float(h >> 8) * (6.28318530f / float(1 << 24));
 
 	const float GOLDEN_ANGLE = 2.39996323f;
-	const float INV_N        = 1.0f / float(samples_per_level);
 
 	float best_occlusion = 0.0f;
 
@@ -474,6 +473,12 @@ __device__ float getSSAOShadingFactor(
 	if(num_levels > 4) num_levels = 4;
 
 	for(int level = 0; level < num_levels; level++){
+		// Sample count is per level: far-scale occlusion is low-frequency, so it needs
+		// far fewer samples than the close level and the bilateral blur absorbs the rest.
+		int   n_samples = samples_per_level[level];
+		if(n_samples < 1) n_samples = 1;
+		const float INV_N = 1.0f / float(n_samples);
+
 		float radius_fraction = radius_fractions[level];
 		float bias_factor     = bias_factors[level];
 		float world_radius    = center_depth * radius_fraction;
@@ -484,7 +489,7 @@ __device__ float getSSAOShadingFactor(
 
 		float occlusion = 0.0f;
 
-		for (int i = 0; i < samples_per_level; ++i) {
+		for (int i = 0; i < n_samples; ++i) {
 			float fi        = (float(i) + 0.5f) * INV_N;
 			float sin_theta = sqrtf(fi);
 			float cos_theta = sqrtf(1.0f - fi);
@@ -629,7 +634,7 @@ void kernel_ssaoOcclusion(
 	float radius_l0, float radius_l1, float radius_l2, float radius_l3,
 	float bias_l0,   float bias_l1,   float bias_l2,   float bias_l3,
 	int   num_levels,
-	int   samples_per_level,
+	int   samples_l0, int samples_l1, int samples_l2, int samples_l3,
 	float intensity
 ){
 	auto grid = cg::this_grid();
@@ -643,13 +648,14 @@ void kernel_ssaoOcclusion(
 	float depth = __uint_as_float(pixel >> 32);
 	float focal_length = c_target.proj[1][1];
 
-	float radii[4]  = { radius_l0, radius_l1, radius_l2, radius_l3 };
-	float biases[4] = { bias_l0,   bias_l1,   bias_l2,   bias_l3   };
+	float radii[4]  = { radius_l0,  radius_l1,  radius_l2,  radius_l3  };
+	float biases[4] = { bias_l0,    bias_l1,    bias_l2,    bias_l3    };
+	int   samples[4]= { samples_l0, samples_l1, samples_l2, samples_l3 };
 
 	float ssao = getSSAOShadingFactor(
 		c_target.colorbuffer, normalbuffer, depth, x, y,
 		c_target.width, c_target.height, focal_length,
-		radii, biases, num_levels, samples_per_level, intensity
+		radii, biases, num_levels, samples, intensity
 	);
 
 	uint64_t occ = uint64_t(__float_as_uint(depth)) << 32 | uint64_t(__float_as_uint(ssao));
@@ -1234,8 +1240,15 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	// Sphere composite — check if a sphere is closer than the triangle
 	if(sphereArgs.sphere_framebuffer != nullptr && sphereArgs.numSpheres > 0) {
 		uint64_t sphere_val = sphereArgs.sphere_framebuffer[pixelID];
-		if(sphere_val != 0xFFFFFFFFFFFFFFFFull) {
-			uint32_t sphere_idx = (uint32_t)(sphere_val & 0xFFFFFFFFull) - 1;
+		// The visbuffer stores index+1, so 0 means "no sphere" just as the all-ones
+		// sentinel does. Subtracting 1 from a raw 0 wraps to 0xFFFFFFFF and indexes
+		// ~17 GB past `colors`, which faults; the same wrap into the 4x smaller
+		// atomTypes buffer often lands in mapped memory and passes silently. Bounds
+		// check once here so every per-atom array below is safe.
+		uint32_t sphere_raw = (uint32_t)(sphere_val & 0xFFFFFFFFull);
+		if(sphere_val != 0xFFFFFFFFFFFFFFFFull && sphere_raw != 0u
+			&& (sphere_raw - 1u) < sphereArgs.numSpheres) {
+			uint32_t sphere_idx = sphere_raw - 1u;
 
 			vec3 center_world = sphereArgs.positions[sphere_idx];
 			float radius      = sphereArgs.radii[sphere_idx];
@@ -1287,11 +1300,17 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// memory of the legacy uint32 buffer. Chain/entity themes still
 				// use the per-atom uint32 buffer because their key spaces don't
 				// fit in a uint8.
+				// `colors` must be tested FIRST. atomTypes + palette are allocated once at
+				// load and stay non-null for the lifetime of the node, so testing them
+				// first made the colors branch unreachable and the chain / entity themes
+				// silently had no effect. applyColorTheme only allocates colors for
+				// CHAIN / ENTITY and frees it again for ELEMENT, so a non-null colors
+				// buffer is exactly the signal that a non-element theme is active.
 				uint32_t base;
-				if(sphereArgs.atomTypes != nullptr && sphereArgs.colorPalette != nullptr){
-					base = sphereArgs.colorPalette[sphereArgs.atomTypes[sphere_idx]];
-				}else if(sphereArgs.colors != nullptr){
+				if(sphereArgs.colors != nullptr){
 					base = sphereArgs.colors[sphere_idx];
+				}else if(sphereArgs.atomTypes != nullptr && sphereArgs.colorPalette != nullptr){
+					base = sphereArgs.colorPalette[sphereArgs.atomTypes[sphere_idx]];
 				}else{
 					base = 0xFFFFFFFFu;
 				}

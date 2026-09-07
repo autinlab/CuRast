@@ -951,6 +951,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			// All radii are multiplied by the global ssaoRadiusScale so the user can retune
 			// for any scene with a single slider.
 			float r0, r1, r2, r3, b0, b1, b2, b3;
+			int   s0, s1, s2, s3;
 			int   numLevels;
 			float scl = CuRastSettings::ssaoRadiusScale;
 			if(CuRastSettings::enableMultiscaleSSAO){
@@ -962,6 +963,10 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				b1 = CuRastSettings::ssaoLevelBias[1];
 				b2 = CuRastSettings::ssaoLevelBias[2];
 				b3 = CuRastSettings::ssaoLevelBias[3];
+				s0 = CuRastSettings::ssaoSamplesPerLevel[0];
+				s1 = CuRastSettings::ssaoSamplesPerLevel[1];
+				s2 = CuRastSettings::ssaoSamplesPerLevel[2];
+				s3 = CuRastSettings::ssaoSamplesPerLevel[3];
 				numLevels = CuRastSettings::ssaoLevels;
 			} else {
 				// Single-scale: take the user's level-0 radius so the tuning slider works.
@@ -969,10 +974,29 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				r1 = r2 = r3 = 0.0f;
 				b0 = CuRastSettings::ssaoLevelBias[0];
 				b1 = b2 = b3 = 0.0f;
+				s0 = CuRastSettings::ssaoSamplesPerLevel[0];
+				s1 = s2 = s3 = 0;
 				numLevels = 1;
 			}
-			int   samplesPerLevel = CuRastSettings::ssaoSamplesPerLevel;
 			float intensity       = CuRastSettings::ssaoIntensity;
+
+			// One-shot report of what actually reached the kernel, plus the camera
+			// framing. SSAO cost scales with covered pixels, so a timing is only
+			// comparable between runs that share a framing.
+			static bool ssaoConfigReported = false;
+			if(!ssaoConfigReported){
+				ssaoConfigReported = true;
+				println("SSAO: multiscale={} levels={} taps/pixel={} intensity={:.2f}",
+					CuRastSettings::enableMultiscaleSSAO, numLevels,
+					(numLevels > 0 ? s0 : 0) + (numLevels > 1 ? s1 : 0)
+					+ (numLevels > 2 ? s2 : 0) + (numLevels > 3 ? s3 : 0),
+					intensity);
+				println("SSAO: radii=[{:.4f} {:.4f} {:.4f} {:.4f}] samples=[{} {} {} {}] scale={:.2f}",
+					r0, r1, r2, r3, s0, s1, s2, s3, scl);
+				println("SSAO: camera radius={:.1f} yaw={:.3f} pitch={:.3f} viewport={}x{}",
+					Runtime::controls->radius, Runtime::controls->yaw,
+					Runtime::controls->pitch, target.width, target.height);
+			}
 
 			void* argsSSAO[] = {
 				&cvm_framebuffer->cptr,
@@ -981,7 +1005,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&r0, &r1, &r2, &r3,
 				&b0, &b1, &b2, &b3,
 				&numLevels,
-				&samplesPerLevel,
+				&s0, &s1, &s2, &s3,
 				&intensity,
 			};
 			void* argsBlur[] = {

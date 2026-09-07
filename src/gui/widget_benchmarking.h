@@ -54,24 +54,50 @@ void makeMultiscaleSSAOControls(){
 		"Multiplier on every level's radius. Increase for big assemblies, decrease for tight cavities.\n"
 		"Effective sample radius = ssaoLevelRadius[k] * scale * pixelDepth");
 	ImGui::SliderFloat("Intensity",        &CuRastSettings::ssaoIntensity,       0.0f, 4.0f);
-	ImGui::SliderInt  ("Samples / level",  &CuRastSettings::ssaoSamplesPerLevel, 8,    64);
-	if(ImGui::IsItemHovered()) ImGui::SetTooltip(
-		"Hemisphere samples per level. Below ~12 the AO becomes visibly noisy and the\n"
-		"bilateral blur cannot fully clean it up.");
+
+	// Total taps per pixel is the headline cost number, so show it next to the sliders.
+	{
+		int totalTaps = 0;
+		int active = CuRastSettings::enableMultiscaleSSAO ? CuRastSettings::ssaoLevels : 1;
+		for(int k = 0; k < active; k++) totalTaps += CuRastSettings::ssaoSamplesPerLevel[k];
+		ImGui::Text("Depth taps / pixel: %d  (sum over %d level%s)",
+			totalTaps, active, active == 1 ? "" : "s");
+	}
 
 	if(CuRastSettings::enableMultiscaleSSAO){
 		ImGui::SliderInt("Levels", &CuRastSettings::ssaoLevels, 1, 4);
 		for(int k = 0; k < CuRastSettings::ssaoLevels; k++){
 			ImGui::PushID(k);
-			ImGui::SeparatorText(("Level " + std::to_string(k)).c_str());
+			const char* role = (k == 0) ? " (close)"
+			                 : (k == CuRastSettings::ssaoLevels - 1) ? " (far)" : "";
+			ImGui::SeparatorText(("Level " + std::to_string(k) + role).c_str());
 			ImGui::SliderFloat("radius (frac of depth)",
 				&CuRastSettings::ssaoLevelRadius[k], 0.0001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
 			ImGui::SliderFloat("bias",
 				&CuRastSettings::ssaoLevelBias[k],   0.0f, 4.0f);
+			ImGui::SliderInt("samples",
+				&CuRastSettings::ssaoSamplesPerLevel[k], 4, 64);
+			if(ImGui::IsItemHovered()) ImGui::SetTooltip(
+				"Hemisphere samples for THIS level. The close level needs the most (below\n"
+				"~12 it goes visibly noisy); a far level is low-frequency and stays smooth\n"
+				"on far fewer taps because the bilateral blur cleans it up.");
 			ImGui::PopID();
 		}
 
 		ImGui::SeparatorText("Presets");
+		if(ImGui::Button("Close + far (2 level, cheapest)")){
+			CuRastSettings::ssaoLevels = 2;
+			CuRastSettings::ssaoLevelRadius[0] = 0.004f;   // close: inter-atom cavities
+			CuRastSettings::ssaoLevelRadius[1] = 0.040f;   // far:   overall enclosure
+			CuRastSettings::ssaoSamplesPerLevel[0] = 24;
+			CuRastSettings::ssaoSamplesPerLevel[1] = 8;
+			CuRastSettings::ssaoRadiusScale = 1.0f;
+		}
+		if(ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"32 depth taps per pixel instead of the 4-level default's 64.\n"
+			"Two levels leave a gap at intermediate scale: if mid-size cavities look\n"
+			"flat, widen the close radius rather than adding levels back.");
+		ImGui::SameLine();
 		if(ImGui::Button("Atomic (tight cavities)")){
 			CuRastSettings::ssaoLevels = 4;
 			CuRastSettings::ssaoLevelRadius[0] = 0.0005f;

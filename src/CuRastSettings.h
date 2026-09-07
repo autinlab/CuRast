@@ -21,7 +21,7 @@ struct CuRastSettings{
 	static inline bool enableMipMapping = true;
 	static inline float threshold = 0.0f;
 	static inline bool freezeFrustum = false;
-	static inline bool enableSSAO = false;
+	static inline bool enableSSAO = true;
 	static inline bool enableDiffuseLighting = false;
 	static inline bool enableTranslucency = false;
 	static inline bool disableInstancing = false;
@@ -64,21 +64,30 @@ struct CuRastSettings{
 
 	// ----- Multiscale SSAO ----------------------------------------------------
 	static inline bool  enableMultiscaleSSAO = true;
-	static inline int   ssaoLevels           = 4;     // 1..4
+	// Two levels by default: a CLOSE level that resolves the cavities between
+	// neighbouring atoms, and a FAR level supplying the broad enclosure / skylight
+	// cue that makes a large assembly read as solid. Cost is the SUM of the active
+	// levels' sample counts, so two levels is materially cheaper than four.
+	static inline int   ssaoLevels           = 2;     // 1..4  (0 = close, 1 = far)
 	// Per-level sample radius expressed as a fraction of the centre pixel's view-space
 	// depth. The previous defaults (0.02..0.7) were tuned for object-space scenes; for
 	// molecular assemblies they were 10–100× too large and sampled across the whole
 	// structure. New defaults span 4 octaves from atom-cavity scale (~0.001) up to ~5%
 	// of depth, which is appropriate for atomic / protein / assembly geometry alike.
-	static inline float ssaoLevelRadius[4]   = { 0.0015f, 0.005f, 0.015f, 0.050f };
-	static inline float ssaoLevelBias[4]     = { 1.0f,    1.0f,   1.0f,   1.0f   };
+	// [0] = close, [1] = far. Slots 2-3 keep the old 4-level values, so setting
+	// ssaoLevels back to 4 restores the previous continuous scale ramp.
+	static inline float ssaoLevelRadius[4]   = { 0.004f, 0.040f, 0.015f, 0.050f };
+	static inline float ssaoLevelBias[4]     = { 1.0f,   1.0f,   1.0f,   1.0f   };
 	// A single multiplier the user can dial to retune for any scene without touching
 	// per-level radii (e.g. set to 0.5 for tight cavities, 4.0 for huge enclosures).
 	static inline float ssaoRadiusScale      = 1.0f;
 	static inline float ssaoIntensity        = 1.1f;
-	// Below ~12 samples the per-pixel noise is too coarse for the 7×7 bilateral blur
-	// to fully resolve. 16 is a good default; molstar's default is 32.
-	static inline int   ssaoSamplesPerLevel  = 16;    // total samples = ssaoSamplesPerLevel * ssaoLevels
+	// Samples are budgeted PER LEVEL. The close level carries the detail the eye reads
+	// as shape, so it takes most of the budget; the far level is low-frequency and looks
+	// the same with far fewer taps once the 7x7 bilateral blur has run. Below ~12 samples
+	// a level goes visibly noisy (molstar uses 32 for its single level).
+	// Total depth taps per pixel = sum over the active levels.
+	static inline int   ssaoSamplesPerLevel[4] = { 24, 8, 16, 16 };
 };
 
 // Enabling this makes CuRast allocate memory for geometry with the Vulkan API instead of CUDA.
