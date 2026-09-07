@@ -17,6 +17,7 @@ struct Node
 	float                 min_z;
 	uint32_t              index_min;
 	uint32_t              bitsPerIndex;
+	uint32_t              cummulativeTriangleIndex;
 };
 
 [[vk::push_constant]]
@@ -31,7 +32,8 @@ struct VertOut
 	float4               pos        : SV_Position;
 	float2               uv         : TEXCOORD0;
 	nointerpolation uint texHandle  : TEXCOORD1;
-	float                depth;
+	float depth;
+	nointerpolation uint triangleID;
 };
 
 uint32_t readBits(uint32_t* data, uint32_t  bitOffset, uint32_t  bitCount) {
@@ -76,6 +78,7 @@ VertOut main_vertex_instanced(
 	}
 
 	o.depth = o.pos.w;
+	o.triangleID = node.cummulativeTriangleIndex + vertexID / 3;
 
 	return o;
 }
@@ -106,6 +109,7 @@ VertOut main_vertex_compressed_instanced(
 	}
 
 	o.depth = o.pos.w;
+	o.triangleID = node.cummulativeTriangleIndex + vertexID / 3;
 
 	return o;
 }
@@ -113,6 +117,16 @@ VertOut main_vertex_compressed_instanced(
 [shader("fragment")]
 float4 main_fragment(VertOut fragment) : SV_Target0
 {
+
+	// uint C = fragment.triangleID * 12345678;
+	// float4 color = float4(
+	// 	float((C >>  0) & 0xff) / 256.0f,
+	// 	float((C >>  8) & 0xff) / 256.0f,
+	// 	float((C >> 16) & 0xff) / 256.0f,
+	// 	1.0f,
+	// );
+
+	// return color;
 
 	if(fragment.texHandle != 0xffffffff){
 		// float2 uv = clamp(fmod(fragment.uv, 1.0), 0.0, 1.0);

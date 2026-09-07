@@ -28,6 +28,8 @@ using glm::ivec2;
 using glm::i8vec4;
 using glm::vec4;
 
+constexpr bool ENABLE_FRAGCOUNTING = false;
+
 // Some compile-time template specializations here because for perf reasons, 
 // we need each variation of getVertex to be a separately compiled function.
 // Branching at runtime may increase rendering duration by a couple of percent.
@@ -121,6 +123,42 @@ void rasterize(
 	vec2 a_screen = ndcToScreen(a_ndc, args.target.width, args.target.height);
 	vec2 b_screen = ndcToScreen(b_ndc, args.target.width, args.target.height);
 	vec2 c_screen = ndcToScreen(c_ndc, args.target.width, args.target.height);
+
+	// bottom-right to top-left
+	// if(triangleIndex == 0)
+	// {
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.0f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 0.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }else if(triangleIndex == 1){
+	// 	a_ndc = {0.5f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.5f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {300.0f, 0.0f};
+	// 	b_screen = {300.0f, 300.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }
+	// bottom-left to top-right
+	// if(triangleIndex == 0)
+	// {
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.0f, 1.0f};
+	// 	c_ndc = {0.5f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 0.0f};
+	// 	c_screen = {300.0f, 300.0f};
+	// }else if(triangleIndex == 1){
+	// 	a_ndc = {0.0f, 0.0f, 1.0f};
+	// 	b_ndc = {0.5f, 0.5f, 1.0f};
+	// 	c_ndc = {0.0f, 0.5f, 1.0f};
+	// 	a_screen = {0.0f, 0.0f};
+	// 	b_screen = {300.0f, 300.0f};
+	// 	c_screen = {0.0f, 300.0f};
+	// }
+	
 
 	// NOTE: To make sure the pixel sample is in the center, 
 	//       we can either add a SAMPLE_OFFSET to the computations or 
@@ -240,7 +278,7 @@ void rasterize(
 			for(int fragX = 0; fragX < size_x; fragX++){
 				float v = 1.0f - (s + t);
 				
-				if (s > 0.0f && t > 0.0f && v > 0.0f){
+				if (s >= 0.0f && t >= 0.0f && v >= 0.0f){
 					if (pixelID < numPixels){
 						// Perspective-correct interpolation using precomputed inverses
 						float inv_depth = v * inv_z_a + s * inv_z_b + t * inv_z_c;
@@ -253,6 +291,9 @@ void rasterize(
 							sh_mesh.cummulativeTriangleCount + triangleIndex + instanceIndex * sh_mesh.numTriangles
 						);
 						atomicMin(&args.target.framebuffer[pixelID], pixel);
+						if constexpr (ENABLE_FRAGCOUNTING){
+							atomicAdd(&args.state->dbg_fragcount, 1);
+						}
 					}
 				}
 
@@ -296,6 +337,7 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 		sh_blockLocalBatchIndex = 0;
 		sh_meshIndex = 0;
 		sh_mesh = args.meshes[0];
+		args.state->dbg_fragcount = 0;
 	}
 
 	grid.sync();
@@ -556,6 +598,17 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 
 					uint64_t pixel = pack_pixel(depth, packed_id);
 					atomicMin(&args.target.framebuffer[pixelID], pixel);
+
+					if constexpr (ENABLE_FRAGCOUNTING){
+						atomicAdd(&args.state->dbg_fragcount, 1);
+					}
+
+					// if(px == args.target.width){
+					// 	args.target.colorbuffer[pixelID] = 0x00000000'ff0000ff;
+					// }
+					// if(px < 0){
+					// 	args.target.colorbuffer[pixelID] = 0x00000000'ff00ffff;
+					// }
 				}
 			}
 		}
@@ -662,7 +715,7 @@ void stage3_drawHugeTriangles(RasterArgs args){
 			float v = 1.0f - (s + t);
 
 			// Only proceed if the fragment is inside the triangle
-			if(s > 0.0f && t > 0.0f && v > 0.0f) {
+			if(s >= 0.0f && t >= 0.0f && v >= 0.0f) {
 				int2 pixelCoords = make_int2(pFrag.x, pFrag.y);
 				int pixelID = toFramebufferIndex(pixelCoords.x, pixelCoords.y, args.target.width);
 
@@ -674,6 +727,9 @@ void stage3_drawHugeTriangles(RasterArgs args){
 					uint64_t pixel = pack_pixel(depth, mesh.cummulativeTriangleCount + tri.triangleIndex);
 
 					atomicMin(&args.target.framebuffer[pixelID], pixel);
+					if constexpr (ENABLE_FRAGCOUNTING){
+						atomicAdd(&args.state->dbg_fragcount, 1);
+					}
 				}
 			}
 		}
@@ -737,6 +793,9 @@ void stage3_drawHugeTriangles(RasterArgs args){
 			uint64_t pixel = pack_pixel(depth, mesh.cummulativeTriangleCount + tri.triangleIndex);
 
 			atomicMin(&args.target.framebuffer[pixelID], pixel);
+			if constexpr (ENABLE_FRAGCOUNTING){
+				atomicAdd(&args.state->dbg_fragcount, 1);
+			}
 
 		}
 

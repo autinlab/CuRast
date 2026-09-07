@@ -127,6 +127,7 @@ struct DeviceState{
 	uint32_t dbg_hovered_mcu_y;
 	uint32_t dbg_hovered_mcu;
 	uint32_t dbg_hovered_decoded_color;
+	uint64_t dbg_fragcount;
 };
 
 struct RenderTarget{
@@ -183,6 +184,7 @@ struct Texture{
 	QuantizationTable* quanttables;
 	uint32_t* mcuPositions;
 	uint32_t handle;
+	bool isTranslucent;
 };
 
 struct JpegPipeline{
@@ -259,9 +261,18 @@ struct HugeTriangle{
 	int tile_y;
 };
 
+struct TranslucentTriangle{
+	int meshIndex;
+	int triangleIndex;
+	int tile_x;
+	int tile_y;
+};
+
 constexpr int TILE_SIZE = 64;
+constexpr int TILE_SIZE_TRANSLUCENT = 16;
 constexpr uint32_t TRIANGLES_PER_SWEEP = 256;
 constexpr uint32_t MAX_HUGE_TRIANGLES = 5'000'000;
+constexpr uint32_t MAX_TRANSLUCENT_TRIANGLES = 5'000'000;
 constexpr uint32_t MAX_NONTRIVIAL_TRIANGLES = 5'000'000;
 constexpr uint32_t THRESHOLD_SMALL = 128;
 constexpr uint32_t THRESHOLD_LARGE = 4096;
@@ -321,6 +332,7 @@ struct RasterArgs{
 	uint32_t* nontrivialTrianglesCounter;
 	uint64_t* nontrivialTrianglesList;
 	RenderTarget target;
+	DeviceState* state;
 };
 
 extern __constant__ RenderTarget c_target;
