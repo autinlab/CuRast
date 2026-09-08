@@ -321,6 +321,129 @@ __device__ inline vec3 worldNormalToSsaoView(vec3 N_world){
 	return out;
 }
 
+// ── Environment lighting (image-based) ───────────────────────────────────────
+//
+// Replaces the previous single hardcoded directional light
+// (L = normalize(1,1,1); shade = d * 0.7 + 0.5), which gave every surface nearly
+// the same tone regardless of orientation and was the main reason the render
+// looked flat. No amount of AO can fix a constant ambient term, because AO only
+// modulates ambient.
+//
+// Diffuse irradiance is stored as a 9-coefficient spherical-harmonic projection
+// of an HDR environment map. SH9 is exact to within a fraction of a percent for
+// Lambertian diffuse (Ramamoorthi & Hanrahan 2001), so this needs no cubemap, no
+// prefilter pass and no texture fetch -- just 9 constants and ~30 flops. That is
+// about what the old normalize()+dot() cost, and it gives every surface
+// orientation its own colour.
+//
+// Coefficients below are A_l * L_lm projected from brown_photostudio_02_4k.hdr
+// at 4096x2048, with world up = +Z to match OrbitControls. Regenerate for a
+// different map with src/tools/sh9.py.
+__device__ const float c_envSH[9][3] = {
+	{  8.220565f,  8.002558f,  7.907027f},  // Y00
+	{  3.049849f,  3.024605f,  3.004809f},  // Y1-1
+	{  2.558317f,  2.577100f,  2.717383f},  // Y10
+	{  3.082418f,  3.010968f,  2.954998f},  // Y11
+	{  1.233800f,  1.196936f,  1.165705f},  // Y2-2
+	{  1.296646f,  1.292287f,  1.292104f},  // Y2-1
+	{  0.095700f,  0.133699f,  0.199860f},  // Y20
+	{  1.322162f,  1.317976f,  1.304159f},  // Y21
+	{  0.018696f,  0.006439f, -0.003603f},  // Y22
+};
+
+// Brightest 0.5% of the same map, used as a specular key so highlights have a
+// direction. Diffuse SH alone cannot produce a highlight -- l<=2 is far too
+// low-frequency to represent a light source.
+__device__ const float c_envKeyDir[3]   = {0.664108f, 0.456129f, 0.592374f};
+__device__ const float c_envKeyColor[3] = {1.000000f, 0.969328f, 0.942787f};
+
+#define ENV_EXPOSURE     0.85f   // scales SH irradiance; this studio map integrates to slightly >1
+#define ENV_SPEC_INTENS  0.28f   // specular key strength
+#define ENV_SPEC_POWER   32.0f   // Blinn-Phong exponent
+#define ENV_RIM_INTENS   0.18f   // Fresnel rim, the QuteMol-style silhouette cue
+
+// Evaluate SH9 diffuse irradiance E(N). N must be a unit world-space normal
+// (world up = +Z, matching the basis the coefficients were projected in).
+__device__ inline void shIrradiance(vec3 N, float* out){
+	float Y[9];
+	Y[0] = 0.282095f;
+	Y[1] = 0.488603f * N.y;
+	Y[2] = 0.488603f * N.z;
+	Y[3] = 0.488603f * N.x;
+	Y[4] = 1.092548f * N.x * N.y;
+	Y[5] = 1.092548f * N.y * N.z;
+	Y[6] = 0.315392f * (3.0f * N.z * N.z - 1.0f);
+	Y[7] = 1.092548f * N.x * N.z;
+	Y[8] = 0.546274f * (N.x * N.x - N.y * N.y);
+
+	out[0] = 0.0f; out[1] = 0.0f; out[2] = 0.0f;
+	for(int i = 0; i < 9; i++){
+		out[0] += c_envSH[i][0] * Y[i];
+		out[1] += c_envSH[i][1] * Y[i];
+		out[2] += c_envSH[i][2] * Y[i];
+	}
+	// A truncated SH series can ring slightly negative for high-contrast maps.
+	out[0] = fmaxf(out[0], 0.0f);
+	out[1] = fmaxf(out[1], 0.0f);
+	out[2] = fmaxf(out[2], 0.0f);
+}
+
+// The old code multiplied 8-bit sRGB values by a lighting factor directly. That
+// is wrong -- light adds linearly, sRGB does not -- and it is a large part of why
+// the midtones looked washed out. Convert properly on the way in and out.
+__device__ inline float srgbToLinear(float c){
+	return (c <= 0.04045f) ? (c * (1.0f / 12.92f)) : powf((c + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+__device__ inline float linearToSrgb(float c){
+	return (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * powf(c, 1.0f / 2.4f) - 0.055f);
+}
+
+// Narkowicz ACES filmic approximation. Keeps the specular key from clipping to
+// flat white and holds saturation in the bright end.
+__device__ inline float tonemapACES(float x){
+	x = fmaxf(x, 0.0f);
+	float r = (x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f);
+	return clamp(r, 0.0f, 1.0f);
+}
+
+// Full environment shade for one surface point.
+//   base : packed albedo as stored by the colour themes
+//   N    : unit world-space normal
+//   V    : unit world-space direction from the surface toward the eye
+// Byte order in / out matches the existing call sites (component 0,1,2 of the
+// packed word, alpha forced opaque).
+__device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
+	uint8_t* bi = (uint8_t*)&base;
+
+	float E[3];
+	shIrradiance(N, E);
+
+	vec3 Lk = vec3(c_envKeyDir[0], c_envKeyDir[1], c_envKeyDir[2]);
+	vec3 H  = normalize(Lk + V);
+	float ndoth = fmaxf(dot(N, H), 0.0f);
+	float ndotl = fmaxf(dot(N, Lk), 0.0f);
+	// Gate the highlight on N.L so the far side of a sphere cannot show a
+	// specular lobe from a light it does not face.
+	float spec = (ndotl > 0.0f) ? (ENV_SPEC_INTENS * powf(ndoth, ENV_SPEC_POWER)) : 0.0f;
+
+	// Schlick-style Fresnel rim: brightens grazing angles, which outlines each
+	// atom against its neighbours. This is the cue QuteMol gets from its
+	// depth-aware silhouettes, obtained here for a few flops.
+	float ndotv = fmaxf(dot(N, V), 0.0f);
+	float omn   = 1.0f - ndotv;
+	float rim   = ENV_RIM_INTENS * omn * omn * omn * omn;
+
+	uint32_t outColor = 0xff000000;
+	uint8_t* bo = (uint8_t*)&outColor;
+	for(int c = 0; c < 3; c++){
+		float albedo = srgbToLinear(float(bi[c]) * (1.0f / 255.0f));
+		float lit    = albedo * E[c] * (ENV_EXPOSURE / 3.14159265f)
+		             + c_envKeyColor[c] * (spec + rim);
+		bo[c] = (uint8_t)(linearToSrgb(tonemapACES(lit)) * 255.0f + 0.5f);
+	}
+	return outColor;
+}
+
 // ── SSAO Helpers ─────────────────────────────────────────────────────────────
 
 // Reconstruct view-space position from screen pixel + linear depth.
@@ -527,6 +650,221 @@ __device__ float getSSAOShadingFactor(
 	}
 
 	return clamp(1.0f - best_occlusion * intensity, 0.0f, 1.0f);
+}
+
+// How the AO buffer is turned into a shading multiplier.
+//
+// This used to be `ao * 0.4 + 0.6`, which remaps AO into [0.6, 1.0]. Measured on
+// the mycoplasma cell the AO buffer itself spans roughly 0.55-0.95, so after that
+// remap the darkest crevice and the most open surface differed by about 5% -- the
+// occlusion was computed correctly and then almost entirely discarded on the way
+// to the image. That, more than the sampling quality, is why AO "did nothing".
+//
+// Full range is used instead, with a floor so deep cavities stay readable rather
+// than crushing to black, and a power > 1 to deepen contact shadows without
+// darkening open surfaces.
+#define AO_FLOOR 0.06f
+#define AO_POWER 1.7f
+
+__device__ inline float applyAO(float ao){
+	ao = clamp(ao, 0.0f, 1.0f);
+	return AO_FLOOR + (1.0f - AO_FLOOR) * powf(ao, AO_POWER);
+}
+
+// ── GTAO (Ground Truth Ambient Occlusion) ────────────────────────────────────
+//
+// Replaces the hemisphere point-sampling above. That sampler draws N directions
+// in the hemisphere and counts hits -- a Monte Carlo estimate whose variance
+// lands directly in the image as speckle, and which needs a lot of samples to
+// settle. Averaging it down with a wide bilateral blur trades the speckle for
+// mush, which is what "not looking good" was.
+//
+// GTAO (Jimenez et al. 2016) slices the hemisphere with planes containing the
+// view vector. In each slice it searches screen space for the largest horizon
+// angle either side of the pixel, then evaluates the cosine-weighted visibility
+// integral over that entire slice ANALYTICALLY. Each slice returns a smooth
+// exact answer for its plane instead of a noisy estimate of a few directions,
+// so a few slices beat many hemisphere samples at equal cost.
+//
+// Slices are AVERAGED. The previous multiscale code combined levels with
+// max(), which promotes whichever level is noisiest into the result; averaging
+// is the correct combine for a visibility integral.
+//
+// Note the horizon defaults: an unoccluded direction has its horizon at pi/2
+// from V, not pi, because a screen-space search can only see the hemisphere
+// facing the camera. Starting the search at cos(h) = 0 rather than -1 is what
+// makes an open surface integrate to visibility 1 instead of overshooting.
+__device__ inline float gtaoArc(float h, float n, float cos_n, float sin_n){
+	// Jimenez et al. 2016, eq. 7 -- one side of one slice.
+	return -cosf(2.0f * h - n) + cos_n + 2.0f * h * sin_n;
+}
+
+// `radius_fraction` is the world-space search radius as a fraction of the pixel's
+// depth, so the screen-space footprint is constant with distance (the same
+// scale-agnostic trick the old sampler used).
+// `thickness` widens the distance falloff; occluders beyond it stop counting,
+// which prevents distant silhouettes from over-darkening foreground surfaces.
+__device__ float getGTAOShadingFactor(
+	uint64_t* colorbuffer,
+	uint32_t* normalbuffer,
+	float     center_depth,
+	int x, int y,
+	int width, int height,
+	float radius_fraction,
+	int   num_slices,
+	int   num_steps,
+	float intensity,
+	float thickness
+){
+	if(isinf(center_depth) || center_depth <= 0.0f) return 1.0f;
+
+	if(num_slices < 1) num_slices = 1;
+	if(num_steps  < 1) num_steps  = 1;
+
+	vec3 P = ssao_viewPos(float(x), float(y), center_depth, width, height);
+
+	// Depth is +Z away from the eye, so the direction back to the eye is -P.
+	vec3 V = normalize(P * -1.0f);
+
+	vec3 N;
+	if(normalbuffer != nullptr){
+		uint32_t packed = normalbuffer[y * width + x];
+		if((packed >> 24) != 0u){
+			N = normalize(unpackNormalGBuf(packed));
+		} else {
+			N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
+		}
+	} else {
+		N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
+	}
+
+	float world_radius = center_depth * radius_fraction;
+	if(world_radius <= 0.0f) return 1.0f;
+
+	// Screen-space search radius. A world offset r at depth z projects to
+	// proj[i][i] * (r/z) * 0.5 * extent pixels, and r/z is radius_fraction, so this
+	// is independent of depth.
+	float rx = c_target.proj[0][0] * radius_fraction * 0.5f * float(width);
+	float ry = c_target.proj[1][1] * radius_fraction * 0.5f * float(height);
+
+	// Per-pixel slice rotation + step jitter. Interleaving the pattern spatially
+	// lets the bilateral blur recover the between-slice directions cheaply.
+	uint32_t h = uint32_t(x) * 2246822519u ^ uint32_t(y) * 3266489917u;
+	h ^= h >> 13; h *= 0xbf58476du; h ^= h >> 31;
+	float rot    = float(h >> 8) * (1.0f / float(1 << 24));
+	float jitter = float((h >> 3) & 0xffffu) * (1.0f / 65536.0f);
+
+	const float PI     = 3.14159265f;
+	const float HALFPI = 1.57079633f;
+
+	float visibility = 0.0f;
+
+	for(int s = 0; s < num_slices; s++){
+		float phi = (float(s) + rot) * (PI / float(num_slices));
+		float dx  = cosf(phi);
+		float dy  = sinf(phi);
+
+		// View-space direction corresponding to moving along (dx, dy) in pixels at
+		// constant depth. Needed because the pixel grid is anisotropic in view space,
+		// so the slice tangent is not simply (dx, dy, 0).
+		vec3 dirView = vec3(dx / (float(width) * c_target.proj[0][0]),
+		                    dy / (float(height) * c_target.proj[1][1]),
+		                    0.0f);
+
+		// In-slice axis perpendicular to V, pointing along +(dx, dy).
+		vec3 T = dirView - V * dot(dirView, V);
+		float Tlen = length(T);
+		if(Tlen < 1e-12f) continue;
+		T = T / Tlen;
+
+		// Normal projected into the slice plane, and its signed angle from V.
+		vec3  sliceNormal = cross(V, T);
+		vec3  projN       = N - sliceNormal * dot(N, sliceNormal);
+		float projNlen    = length(projN);
+		if(projNlen < 1e-6f) continue;
+		vec3 projNn = projN / projNlen;
+
+		float n     = atan2f(dot(projNn, T), dot(projNn, V));
+		float cos_n = cosf(n);
+		float sin_n = sinf(n);
+
+		// Horizon search. cos(h) = 0 means "no occluder found" (horizon at pi/2).
+		float cosH[2] = {0.0f, 0.0f};
+
+		for(int side = 0; side < 2; side++){
+			float sgn  = (side == 0) ? 1.0f : -1.0f;
+			float best = 0.0f;
+
+			for(int st = 1; st <= num_steps; st++){
+				float t  = (float(st) - jitter) / float(num_steps);
+				float px = float(x) + sgn * dx * rx * t;
+				float py = float(y) + sgn * dy * ry * t;
+
+				int sx = clamp(int(px), 0, width  - 1);
+				int sy = clamp(int(py), 0, height - 1);
+
+				float d = __uint_as_float(colorbuffer[sy * width + sx] >> 32);
+				if(isinf(d) || d <= 0.0f) continue;
+
+				vec3  S  = ssao_viewPos(px, py, d, width, height);
+				vec3  ds = S - P;
+				float len = length(ds);
+				if(len < 1e-6f) continue;
+
+				float c = dot(ds / len, V);
+
+				// Distance falloff toward 0 == horizon at pi/2 == no occlusion, so a
+				// receding occluder fades out smoothly instead of popping.
+				float falloff = 1.0f - (len / (world_radius * thickness));
+				falloff = clamp(falloff, 0.0f, 1.0f);
+
+				c *= falloff;
+				if(c > best) best = c;
+			}
+			cosH[side] = best;
+		}
+
+		// Signed horizon angles, clamped to the hemisphere around the normal.
+		float h1 = n + fminf( acosf(clamp(cosH[0], -1.0f, 1.0f)) - n,  HALFPI);
+		float h2 = n + fmaxf(-acosf(clamp(cosH[1], -1.0f, 1.0f)) - n, -HALFPI);
+
+		visibility += projNlen * 0.25f * (gtaoArc(h1, n, cos_n, sin_n)
+		                                + gtaoArc(h2, n, cos_n, sin_n));
+	}
+
+	visibility = clamp(visibility / float(num_slices), 0.0f, 1.0f);
+
+	return clamp(1.0f - (1.0f - visibility) * intensity, 0.0f, 1.0f);
+}
+
+extern "C" __global__
+void kernel_gtaoOcclusion(
+	uint64_t* occlusionBuffer,
+	float* ssaoShadeBuffer,
+	uint32_t* normalbuffer,
+	float radius_fraction,
+	int   num_slices,
+	int   num_steps,
+	float intensity,
+	float thickness
+){
+	auto grid = cg::this_grid();
+	int x = grid.thread_index().x;
+	int y = grid.thread_index().y;
+
+	if(x >= c_target.width || y >= c_target.height) return;
+
+	int pixelID = toFramebufferIndex(x, y, c_target.width);
+	uint64_t pixel = c_target.colorbuffer[pixelID];
+	float depth = __uint_as_float(pixel >> 32);
+
+	float ao = getGTAOShadingFactor(
+		c_target.colorbuffer, normalbuffer, depth, x, y,
+		c_target.width, c_target.height,
+		radius_fraction, num_slices, num_steps, intensity, thickness
+	);
+
+	occlusionBuffer[pixelID] = uint64_t(__float_as_uint(depth)) << 32 | uint64_t(__float_as_uint(ao));
 }
 
 extern "C" __global__
@@ -1150,16 +1488,14 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			n1 = mesh.world * vec4(n1, 0.0f);
 			n2 = mesh.world * vec4(n2, 0.0f);
 
-			vec3 N = n0 * (1.0f - stv.x - stv.y) + n1 * stv.x + n2 * stv.y;
-			vec3 L = normalize(vec3{1.0f, 1.0f, 1.0f});
-			float d = max(dot(N, L), 0.0f);
+			vec3 N = normalize(n0 * (1.0f - stv.x - stv.y) + n1 * stv.x + n2 * stv.y);
 
-			vec3 ambient = {0.5, 0.5f, 0.5f};
-			vec3 diffuse = {0.7f, 0.7f, 0.7f};
+			// Same image-based lighting the sphere path uses, so meshes and atoms
+			// sit in the same environment instead of under two different lights.
+			vec3 p_world = a_world * (1.0f - stv.x - stv.y) + b_world * stv.x + c_world * stv.y;
+			vec3 V = normalize(c_target.cameraPos - p_world);
 
-			rgb[0] = clamp((d * diffuse.x + ambient.x) * float(rgb[0]), 0.0f, 255.0f);
-			rgb[1] = clamp((d * diffuse.y + ambient.y) * float(rgb[1]), 0.0f, 255.0f);
-			rgb[2] = clamp((d * diffuse.z + ambient.z) * float(rgb[2]), 0.0f, 255.0f);
+			color = shadeEnvironment(color, N, V);
 		}
 
 		// Highlight hovered mesh: draw borders
@@ -1291,10 +1627,6 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			}
 
 			if(shade_sphere && sphere_depth < depth) {
-				vec3 L = normalize(vec3{1.0f, 1.0f, 1.0f});
-				float d = max(dot(N, L), 0.0f);
-				float shade = d * 0.7f + 0.5f;
-
 				// Two color paths. Element coloring (default theme) is the
 				// 1-byte-per-atom + 256-entry palette path — saves 4× the GPU
 				// memory of the legacy uint32 buffer. Chain/entity themes still
@@ -1314,14 +1646,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				}else{
 					base = 0xFFFFFFFFu;
 				}
-				uint8_t* bi = (uint8_t*)&base;
-				uint32_t sphere_color = 0xff000000;
-				uint8_t* bo = (uint8_t*)&sphere_color;
-				bo[0] = (uint8_t)clamp(shade * float(bi[0]), 0.0f, 255.0f);
-				bo[1] = (uint8_t)clamp(shade * float(bi[1]), 0.0f, 255.0f);
-				bo[2] = (uint8_t)clamp(shade * float(bi[2]), 0.0f, 255.0f);
-
-				color = sphere_color;
+				// Image-based lighting from the environment SH, plus a directional
+				// specular key and a Fresnel rim. V is the direction back toward the
+				// eye, which for a primary ray is just -rayDir.
+				color = shadeEnvironment(base, N, -rayDir);
 				depth = sphere_depth;
 
 				// Stash the analytic sphere normal (in SSAO view space) for the AO
@@ -1391,7 +1719,7 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 			}
 
 			if(enableSSAO){
-				ssao = ssaoShadeBuffer[pixelID] * 0.4f + 0.6f;
+				ssao = applyAO(ssaoShadeBuffer[pixelID]);
 			}
 
 			if(isinf(depth)) sampleColor = backgroundColor;
@@ -1506,7 +1834,7 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 		}
 
 		if(enableSSAO){
-			ssao = ssao / float(numSamples);
+			ssao = applyAO(ssao / float(numSamples));
 		}else{
 			ssao = 1.0f;
 		}
@@ -1534,7 +1862,8 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	bool enableSSAO,
 	int windowWidth,
 	int windowHeight,
-	uint32_t backgroundColor
+	uint32_t backgroundColor,
+	bool showAOBuffer
 ) {
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -1552,6 +1881,20 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	float depth = __uint_as_float(pixel >> 32);
 	uint32_t color = pixel & 0xffffffff;
 
+	// Debug: write the raw AO term as greyscale. Judging AO through albedo and
+	// lighting hides whether it carries any large-scale signal at all.
+	if(showAOBuffer){
+		uint32_t g = 0xff000000;
+		if(!isinf(depth)){
+			float ao = ssaoShadeBuffer[pixelID];
+			uint8_t v = (uint8_t)(clamp(ao, 0.0f, 1.0f) * 255.0f + 0.5f);
+			uint8_t* p = (uint8_t*)&g;
+			p[0] = v; p[1] = v; p[2] = v;
+		}
+		screenshot[pixelID] = g;
+		return;
+	}
+
 	float edl = 1.0f;
 	float ssao = 1.0f;
 
@@ -1561,7 +1904,7 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	}
 
 	if(enableSSAO){
-		ssao = ssaoShadeBuffer[pixelID] * 0.4f + 0.6f;
+		ssao = applyAO(ssaoShadeBuffer[pixelID]);
 	}
 
 	if(isinf(depth)) color = backgroundColor;
@@ -2154,16 +2497,14 @@ void kernel_resolve_jpeg(
 			n1 = mesh.world * vec4(n1, 0.0f);
 			n2 = mesh.world * vec4(n2, 0.0f);
 
-			vec3 N = n0 * (1.0f - stv.x - stv.y) + n1 * stv.x + n2 * stv.y;
-			vec3 L = normalize(vec3{1.0f, 1.0f, 1.0f});
-			float d = max(dot(N, L), 0.0f);
+			vec3 N = normalize(n0 * (1.0f - stv.x - stv.y) + n1 * stv.x + n2 * stv.y);
 
-			vec3 ambient = {0.5, 0.5f, 0.5f};
-			vec3 diffuse = {0.7f, 0.7f, 0.7f};
+			// Same image-based lighting the sphere path uses, so meshes and atoms
+			// sit in the same environment instead of under two different lights.
+			vec3 p_world = a_world * (1.0f - stv.x - stv.y) + b_world * stv.x + c_world * stv.y;
+			vec3 V = normalize(c_target.cameraPos - p_world);
 
-			rgb[0] = clamp((d * diffuse.x + ambient.x) * float(rgb[0]), 0.0f, 255.0f);
-			rgb[1] = clamp((d * diffuse.y + ambient.y) * float(rgb[1]), 0.0f, 255.0f);
-			rgb[2] = clamp((d * diffuse.z + ambient.z) * float(rgb[2]), 0.0f, 255.0f);
+			color = shadeEnvironment(color, N, V);
 		}
 
 		// Highlight hovered mesh: draw borders

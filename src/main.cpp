@@ -619,6 +619,16 @@ void update(){
 
 int main(int argc, char** argv){
 
+	// Redirected stdout is block-buffered, so a crash discards whatever is still in
+	// the buffer -- a segfault during a scripted capture left a completely empty log.
+	// Line-buffer from the very first statement so the last line printed before a
+	// crash always survives.
+	if(getenv("CURAST_AUTOSHOT") != nullptr){
+		setvbuf(stdout, nullptr, _IOLBF, 0);
+		setvbuf(stderr, nullptr, _IOLBF, 0);
+	}
+
+
 	// Find project root: walk up from the executable until we find ./src/kernels.
 	// Lets the app launch from anywhere (e.g. double-click in build\Release).
 	{
@@ -714,6 +724,25 @@ int main(int argc, char** argv){
 		}
 
 	});
+
+	// Per-kernel CUDA timings are gated behind the GUI "Timings" toggle
+	// (CuRast.cpp: Timer::enabled = Runtime::measureTimings || ...), so a scripted
+	// capture would otherwise report 0 ms for every kernel. Turn them on whenever a
+	// scripted capture is requested, so AUTOSHOT prints real numbers.
+	if(getenv("CURAST_AUTOSHOT") != nullptr){
+		Runtime::measureTimings = true;
+	}
+
+	// AO parameter overrides, so a tuning sweep is a shell loop rather than one
+	// rebuild per value.
+	if(const char* v = getenv("CURAST_AO_MODE"))      CuRastSettings::aoMode        = atoi(v);
+	if(const char* v = getenv("CURAST_GTAO_RADIUS"))  CuRastSettings::gtaoRadius    = (float)atof(v);
+	if(const char* v = getenv("CURAST_GTAO_SLICES"))  CuRastSettings::gtaoSlices    = atoi(v);
+	if(const char* v = getenv("CURAST_GTAO_STEPS"))   CuRastSettings::gtaoSteps     = atoi(v);
+	if(const char* v = getenv("CURAST_GTAO_INTENS"))  CuRastSettings::gtaoIntensity = (float)atof(v);
+	if(const char* v = getenv("CURAST_GTAO_THICK"))   CuRastSettings::gtaoThickness = (float)atof(v);
+	if(const char* v = getenv("CURAST_SSAO"))         CuRastSettings::enableSSAO    = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_AO_DEBUG"))     CuRastSettings::aoDebugView   = (atoi(v) != 0);
 
 	initScene();
 

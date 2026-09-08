@@ -77,7 +77,8 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 		&CuRastSettings::enableSSAO,
 		&view.framebuffer->width,
 		&view.framebuffer->height,
-		&backgroundColor
+		&backgroundColor,
+		&CuRastSettings::aoDebugView
 	};
 	prog_resolve->launch2D("kernel_resolve_colorbuffer_to_screenshot", args, target.width, target.height);
 
@@ -1012,7 +1013,31 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&cvm_framebuffer->cptr,
 				&cvm_ssaoShadebuffer->cptr
 			};
-			prog->launch2D("kernel_ssaoOcclusion", argsSSAO, target.width, target.height);
+
+			float gtaoRadius    = CuRastSettings::gtaoRadius;
+			int   gtaoSlices    = CuRastSettings::gtaoSlices;
+			int   gtaoSteps     = CuRastSettings::gtaoSteps;
+			float gtaoIntensity = CuRastSettings::gtaoIntensity;
+			float gtaoThickness = CuRastSettings::gtaoThickness;
+
+			void* argsGTAO[] = {
+				&cvm_framebuffer->cptr,
+				&cvm_ssaoShadebuffer->cptr,
+				&cvm_normalbuffer->cptr,
+				&gtaoRadius,
+				&gtaoSlices,
+				&gtaoSteps,
+				&gtaoIntensity,
+				&gtaoThickness,
+			};
+
+			// Both paths write the same packed depth+AO into the scratch framebuffer,
+			// so the bilateral blur downstream is shared.
+			if(CuRastSettings::aoMode == 1){
+				prog->launch2D("kernel_gtaoOcclusion", argsGTAO, target.width, target.height);
+			}else{
+				prog->launch2D("kernel_ssaoOcclusion", argsSSAO, target.width, target.height);
+			}
 			prog->launch2D("kernel_ssaoBlur", argsBlur, target.width, target.height);
 		}
 
@@ -1056,8 +1081,73 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			prog->launch2D("kernel_resolve_colorbuffer_to_opengl_2D", args, target.width, target.height);
 		}
 
+		// Deterministic capture for rendering work. Set CURAST_AUTOSHOT=<path> and
+		// optionally CURAST_AUTOSHOT_FRAME=<n> (default 150) to save one screenshot at
+		// a fixed frame and print the matching per-kernel timings.
+		//
+		// Both halves matter for A/B-ing shading changes. Fixed framing is required
+		// because comparing two runs framed by hand compares two different views, and
+		// the per-kernel mean is the only usable speed signal here -- whole-frame FPS
+		// on this scene swung 86-158 within a single run, which is far wider than any
+		// effect worth measuring.
+		{
+			static int  autoshotFrame = 0;
+			static bool autoshotDone  = false;
+			const char* autoshotPath  = getenv("CURAST_AUTOSHOT");
+
+			if(autoshotPath != nullptr && !autoshotDone){
+				const char* strWhen = getenv("CURAST_AUTOSHOT_FRAME");
+				int when = (strWhen != nullptr) ? atoi(strWhen) : 150;
+
+				// Optional fixed camera: CURAST_AUTOSHOT_VIEW="yaw,pitch,radius,tx,ty,tz".
+				// Frame count alone is NOT a stable framing anchor -- the camera is
+				// auto-framed when the model finishes loading, and load time varies
+				// between runs, so the same frame number gave a close-up in one run and
+				// a wide shot in the next. Re-applied every frame until the capture so
+				// it wins over auto-framing regardless of when loading completes.
+				const char* strView = getenv("CURAST_AUTOSHOT_VIEW");
+				if(strView != nullptr){
+					float yaw, pitch, radius, tx, ty, tz;
+					if(sscanf(strView, "%f,%f,%f,%f,%f,%f", &yaw, &pitch, &radius, &tx, &ty, &tz) == 6){
+						Runtime::controls->yaw    = yaw;
+						Runtime::controls->pitch  = pitch;
+						Runtime::controls->radius = radius;
+						Runtime::controls->target = {tx, ty, tz};
+					}
+				}
+
+				if(++autoshotFrame >= when){
+					CuRastSettings::requestScreenshot = make_shared<string>(string(autoshotPath));
+					autoshotDone = true;
+
+					println("AUTOSHOT: frame={} path={}", autoshotFrame, autoshotPath);
+					for(string label : {
+						"kernel_ssaoOcclusion",
+						"kernel_gtaoOcclusion",
+						"kernel_ssaoBlur",
+						"kernel_resolve_colorbuffer_to_opengl_2D",
+					}){
+						float mean = Runtime::timings.getMean(label);
+						if(mean > 0.0f) println("AUTOSHOT: {} = {:.3f} ms", label, mean);
+					}
+				}
+			}
+		}
+
 		if(CuRastSettings::requestScreenshot){
+			bool wasAutoshot = (getenv("CURAST_AUTOSHOT") != nullptr)
+			                && (*CuRastSettings::requestScreenshot == string(getenv("CURAST_AUTOSHOT")));
+
 			saveScreenshot(target, view, cvm_ssaoShadebuffer->cptr, prog);
+
+			// Quit after a scripted capture so a sweep can run captures back to back.
+			// Whether the app exits on its own after a screenshot is not reliable, and
+			// a run that stays open blocks the next one in the batch.
+			if(wasAutoshot && getenv("CURAST_AUTOSHOT_EXIT") != nullptr){
+				println("AUTOSHOT: saved, exiting");
+				fflush(stdout);
+				exit(0);
+			}
 		}
 
 		unmapCudaVk(mappings);

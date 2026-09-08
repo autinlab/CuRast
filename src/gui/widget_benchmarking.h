@@ -46,6 +46,33 @@ void makeMultiscaleSSAOControls(){
 		return;
 	}
 
+	ImGui::Separator();
+	ImGui::Combo("AO algorithm", &CuRastSettings::aoMode,
+		"Hemisphere (legacy)\0GTAO\0\0");
+	ImGui::SetItemTooltip(
+		"GTAO searches for the horizon in screen space and integrates the visibility\n"
+		"analytically per slice, instead of sampling points in the hemisphere. Much\n"
+		"lower noise per unit cost. It has ONE radius -- the close/far level structure\n"
+		"below applies only to the legacy path.");
+	ImGui::Checkbox("Debug: show AO buffer", &CuRastSettings::aoDebugView);
+
+	if(CuRastSettings::aoMode == 1){
+		ImGui::SliderFloat("Radius (frac. of depth)", &CuRastSettings::gtaoRadius,
+			0.002f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
+		ImGui::SetItemTooltip(
+			"World radius = depth * this, so the screen footprint stays constant with\n"
+			"distance. The large-scale shape cue lives here: small values only find the\n"
+			"cavities between neighbouring atoms.");
+		ImGui::SliderInt  ("Slices",    &CuRastSettings::gtaoSlices, 1, 8);
+		ImGui::SliderInt  ("Steps/side",&CuRastSettings::gtaoSteps,  2, 24);
+		ImGui::SliderFloat("Intensity", &CuRastSettings::gtaoIntensity, 0.0f, 3.0f);
+		ImGui::SliderFloat("Thickness", &CuRastSettings::gtaoThickness, 0.25f, 3.0f);
+		ImGui::Text("Depth taps / pixel: %d",
+			CuRastSettings::gtaoSlices * CuRastSettings::gtaoSteps * 2);
+		ImGui::Separator();
+		ImGui::TextDisabled("Legacy hemisphere controls below are inactive.");
+	}
+
 	// Radius scale: the single most important knob — multiplies all per-level radii.
 	// Use a logarithmic slider since useful values span 0.05× .. 20× across scenes.
 	ImGui::SliderFloat("Radius scale (global)", &CuRastSettings::ssaoRadiusScale,

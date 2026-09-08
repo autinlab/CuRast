@@ -88,6 +88,30 @@ struct CuRastSettings{
 	// a level goes visibly noisy (molstar uses 32 for its single level).
 	// Total depth taps per pixel = sum over the active levels.
 	static inline int   ssaoSamplesPerLevel[4] = { 24, 8, 16, 16 };
+
+	// ----- GTAO ---------------------------------------------------------------
+	// Ground Truth Ambient Occlusion (Jimenez et al. 2016). Horizon search plus an
+	// analytic per-slice visibility integral, instead of the hemisphere point
+	// sampling above. Kept side by side with the old path (aoMode) so the two can
+	// be compared directly rather than swapped blind.
+	//
+	// The close/far LEVEL structure does not carry over: GTAO has one search radius
+	// and gets its quality from slices x steps, not from combining scales.
+	static inline int   aoMode        = 1;      // 0 = legacy hemisphere, 1 = GTAO
+
+	// Search radius as a fraction of the pixel's depth (screen footprint is then
+	// constant with distance). The large-scale "enclosure" cue that makes a packed
+	// cell read as a sphere lives in this number, not in the slice count -- the old
+	// far level probed 0.04 of depth, which is far too short for it.
+	static inline float gtaoRadius    = 0.12f;
+	static inline int   gtaoSlices    = 3;      // hemisphere slices; each is exact, so few are needed
+	static inline int   gtaoSteps     = 8;      // horizon march steps per side
+	static inline float gtaoIntensity = 1.0f;
+	// Multiplies the search radius for the distance falloff. Below 1 makes occluders
+	// fade before the end of the march; above 1 lets far geometry keep occluding.
+	static inline float gtaoThickness = 1.0f;
+	// Debug: render the AO buffer as greyscale instead of the shaded image.
+	static inline bool  aoDebugView   = false;
 };
 
 // Enabling this makes CuRast allocate memory for geometry with the Vulkan API instead of CUDA.
