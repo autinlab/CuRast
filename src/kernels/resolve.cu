@@ -386,6 +386,30 @@ __device__ const float c_envKeyColor[3] = {1.000000f, 0.969328f, 0.942787f};
 // Evaluate SH9 diffuse irradiance E(N). N must be a unit world-space normal
 // (world up = +Z, matching the basis the coefficients were projected in).
 __device__ inline void shIrradiance(vec3 N, float* out){
+	// Environment lighting OFF means no environment: a uniform ambient at the map's
+	// average brightness. Falling back to the baked studio coefficients instead made
+	// the toggle look like a no-op, because those were projected from the same
+	// photostudio map the user had loaded -- switching compared one projection of a
+	// map against another projection of the same map.
+	if(c_env.enabled == 0 && c_shade.envNeutralWhenOff != 0){
+		out[0] = c_envSH[0][0] * 0.282095f;
+		out[1] = c_envSH[0][1] * 0.282095f;
+		out[2] = c_envSH[0][2] * 0.282095f;
+		return;
+	}
+
+	// Rotating the environment must rotate the LIGHTING as well as the background,
+	// or the two disagree about where the light is coming from. The background lookup
+	// offsets its azimuth by +envRotation, which places the map at -envRotation in
+	// world space, so the normal is rotated by +envRotation before the SH is evaluated.
+	if(c_shade.envRotation != 0.0f){
+		float c = cosf(c_shade.envRotation);
+		float s = sinf(c_shade.envRotation);
+		float nx = N.x * c - N.y * s;
+		float ny = N.x * s + N.y * c;
+		N.x = nx; N.y = ny;
+	}
+
 	float Y[9];
 	Y[0] = 0.282095f;
 	Y[1] = 0.488603f * N.y;

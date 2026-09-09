@@ -1038,6 +1038,14 @@ static bool replicateGrid(LoadedMmcif* loaded, int n) {
 	// it. cptr_colors only exists when the active theme is CHAIN/ENTITY — in
 	// that case we re-allocate it at the new replicated size below.
 	bool needsLegacyColors = (loaded->node->cptr_colors != 0);
+
+	// The baked per-atom AO is indexed by sphere index and sized to the OLD atom count,
+	// so it is invalid the moment the atom set changes: every index past the old count
+	// reads out of bounds, and even the in-range values describe different geometry
+	// (a lone copy, not a grid). Drop it here so the renderer re-bakes on the new set.
+	if(loaded->node->cptr_atomAO) MemoryManager::free(loaded->node->cptr_atomAO);
+	loaded->node->cptr_atomAO = 0;
+
 	if(loaded->node->cptr_positions) MemoryManager::free(loaded->node->cptr_positions);
 	if(loaded->node->cptr_radii)     MemoryManager::free(loaded->node->cptr_radii);
 	if(loaded->node->cptr_atomTypes) MemoryManager::free(loaded->node->cptr_atomTypes);
@@ -1115,6 +1123,13 @@ static bool replicateGrid(LoadedMmcif* loaded, int n) {
 		0.0f
 	};
 	loaded->centroid = origCenter + gridCenter;
+
+	// Node bounds must cover the whole grid, not one copy. The AO bake derives its
+	// sweep window from these, so a stale single-copy box would put most replicas
+	// outside the window entirely.
+	loaded->node->aabb.min = loaded->aabbMin;
+	loaded->node->aabb.max = loaded->aabbMax + vec3{ (side - 1) * cell.x, (side - 1) * cell.y, 0.0f };
+
 	loaded->radius   = sqrtf(
 		powf(side * cell.x * 0.5f, 2.0f) +
 		powf(side * cell.y * 0.5f, 2.0f) +

@@ -123,6 +123,9 @@ struct CuRastSettings{
 	// makes its features read smaller relative to the model; lighting is unaffected.
 	static inline float envRotation  = 0.0f;   // degrees
 	static inline float envBgWiden   = 3.0f;
+	// With this on, turning env lighting off gives a uniform ambient instead of the
+	// baked studio SH, so the toggle actually shows what the environment contributes.
+	static inline bool  envNeutralWhenOff = true;
 
 	// ----- Environment lighting -----------------------------------------------
 	// Path to an .exr or .hdr equirectangular environment map. Empty = use the

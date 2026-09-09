@@ -527,6 +527,14 @@ void update(){
 				mmcif::loadedAll.push_back(loaded);
 				CuRastSettings::showBenchmarking = true; // open the replication slider
 
+				// Scripted replication, so the instanced path can be exercised without
+				// driving the GUI. Runs before the camera is framed so the framing covers
+				// the whole grid.
+				if(const char* v = getenv("CURAST_COPIES")){
+					int copies = atoi(v);
+					if(copies > 1) mmcif::replicateGrid(loaded.get(), copies);
+				}
+
 				scene.updateTransformations();
 
 				Runtime::controls->yaw    = -7.204;

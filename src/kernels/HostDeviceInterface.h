@@ -424,6 +424,11 @@ struct ShadeParams {
 	int   debugView;    // see CURAST_DEBUG_* below
 	float envRotation;  // radians, about world +Z, applied to environment lookups
 	float envBgWiden;   // >1 widens the background's effective FOV so the map reads smaller
+	// 1 = env lighting OFF gives a uniform ambient rather than the baked studio SH.
+	// Without this the toggle is nearly invisible whenever the loaded map resembles
+	// the map the baked coefficients came from.
+	int   envNeutralWhenOff;
+	float _pad2[3];
 };
 
 #define CURAST_DEBUG_OFF        0
