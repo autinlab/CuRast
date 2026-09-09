@@ -624,8 +624,13 @@ int main(int argc, char** argv){
 	// Line-buffer from the very first statement so the last line printed before a
 	// crash always survives.
 	if(getenv("CURAST_AUTOSHOT") != nullptr){
-		setvbuf(stdout, nullptr, _IOLBF, 0);
-		setvbuf(stderr, nullptr, _IOLBF, 0);
+		// Unbuffered, NOT _IOLBF. Two reasons: the MSVC CRT maps _IOLBF onto full
+		// buffering anyway, and setvbuf rejects a 0 size for anything except _IONBF --
+		// passing (_IOLBF, 0) trips the invalid-parameter handler and aborts the
+		// process before main gets any further, which looks exactly like a startup
+		// crash with an empty log.
+		setvbuf(stdout, nullptr, _IONBF, 0);
+		setvbuf(stderr, nullptr, _IONBF, 0);
 	}
 
 
@@ -743,6 +748,10 @@ int main(int argc, char** argv){
 	if(const char* v = getenv("CURAST_GTAO_THICK"))   CuRastSettings::gtaoThickness = (float)atof(v);
 	if(const char* v = getenv("CURAST_SSAO"))         CuRastSettings::enableSSAO    = (atoi(v) != 0);
 	if(const char* v = getenv("CURAST_AO_DEBUG"))     CuRastSettings::aoDebugView   = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ENVMAP"))       CuRastSettings::envMapPath    = v;
+	if(const char* v = getenv("CURAST_ENV_EXPOSURE")) CuRastSettings::envExposure   = (float)atof(v);
+	if(const char* v = getenv("CURAST_AO_FLOOR"))     CuRastSettings::aoFloor       = (float)atof(v);
+	if(const char* v = getenv("CURAST_AO_POWER"))     CuRastSettings::aoPower       = (float)atof(v);
 
 	initScene();
 

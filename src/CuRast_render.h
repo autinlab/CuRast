@@ -5,6 +5,7 @@
 #include "jpeg/JpegTextures.h"
 
 #include "Timer.h"
+#include "EnvMap.h"
 #include "VKRenderer.h"
 #include "TextureManager.h"
 #include "types.h"
@@ -557,6 +558,40 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		// memcpy arguments to constant buffer
 		CUdeviceptr cptr_target = prog->getGlobalsPointer("c_target");
 		cuMemcpyHtoDAsync(cptr_target, &target, sizeof(target), 0);
+
+		// Environment lighting. Loading a map and projecting it to SH is host work on a
+		// multi-megapixel image, so it runs only when the path actually changes, not
+		// per frame. c_env.enabled == 0 leaves the device on its baked-in coefficients.
+		{
+			static EnvLighting env = {};
+			static string loadedPath = "\x01"; // sentinel: differs from any real path, including ""
+
+			if(CuRastSettings::envMapReload || loadedPath != CuRastSettings::envMapPath){
+				CuRastSettings::envMapReload = false;
+				loadedPath = CuRastSettings::envMapPath;
+
+				if(loadedPath.empty()){
+					env = {};
+					env.exposure = CuRastSettings::envExposure;
+					env.enabled  = 0;
+					println("EnvMap: using built-in studio coefficients");
+				}else{
+					env = envmap::loadAndProject(loadedPath, CuRastSettings::envExposure);
+				}
+			}
+
+			// Exposure is a live slider, so keep it in sync without reloading the map.
+			env.exposure = CuRastSettings::envExposure;
+
+			CUdeviceptr cptr_env = prog->getGlobalsPointer("c_env");
+			if(cptr_env != 0) cuMemcpyHtoDAsync(cptr_env, &env, sizeof(env), 0);
+
+			AoParams ao = {};
+			ao.floorValue = CuRastSettings::aoFloor;
+			ao.power      = CuRastSettings::aoPower;
+			CUdeviceptr cptr_ao = prog->getGlobalsPointer("c_ao");
+			if(cptr_ao != 0) cuMemcpyHtoDAsync(cptr_ao, &ao, sizeof(ao), 0);
+		}
 
 		// Let the first kernel in the frame be a dummy kernel to take the hit for CUDA-OpenGL interop overhead
 		// (so that we get more accurate timings for the other kernels)

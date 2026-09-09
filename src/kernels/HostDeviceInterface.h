@@ -337,6 +337,38 @@ struct RasterArgs{
 
 extern __constant__ RenderTarget c_target;
 
+// Environment lighting, uploaded to the resolve module's `c_env` constant.
+//
+// Diffuse irradiance is held as a 9-coefficient spherical-harmonic projection of an
+// HDR environment map. SH9 is essentially exact for Lambertian diffuse (Ramamoorthi &
+// Hanrahan 2001), so lighting needs no cubemap, no prefilter chain and no texture
+// fetch -- just these constants and ~30 flops per shaded pixel.
+//
+// vec4 rows rather than vec3 on purpose: __constant__ reads want 16-byte alignment,
+// and a vec3 array would leave the host and device disagreeing about padding.
+struct EnvLighting {
+	vec4 sh[9];      // xyz = A_l * L_lm (RGB), w unused
+	vec4 keyDir;     // xyz = unit direction toward the brightest region of the map
+	vec4 keyColor;   // xyz = that region's colour, normalised to peak 1
+	float exposure;  // scales the SH irradiance
+	int   enabled;   // 0 = use the built-in studio coefficients compiled into resolve.cu
+	float _pad[2];
+};
+
+extern __constant__ EnvLighting c_env;
+
+// How the AO buffer becomes a shading multiplier: shade = floor + (1-floor)*ao^power.
+// A __constant__ rather than kernel parameters because the curve is applied in three
+// separate composite kernels, and threading two more floats through each of them adds
+// signature churn for no benefit.
+struct AoParams {
+	float floorValue;  // darkest a fully occluded pixel may get
+	float power;       // >1 deepens contact shadows without darkening open surfaces
+	float _pad[2];
+};
+
+extern __constant__ AoParams c_ao;
+
 // Sphere LOD configuration. Each level defines a camera-distance band, an atom-skip
 // stride (atom is in level k iff sphereIdx % level[k].stride == 0), and a radius scale
 // (typically stride^(1/scaleBias) so projected screen area stays ~constant). At render

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 set(TARGET_NAME CuRast) 
-project(${TARGET_NAME} LANGUAGES CXX CUDA)
+project(${TARGET_NAME} LANGUAGES C CXX CUDA)
 set(CMAKE_CXX_STANDARD 23)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -33,6 +33,10 @@ file(GLOB PROJECT_SOURCES CONFIGURE_DEPENDS
 	#src/kernels/rasterization_utils.cu
 )
 
+# miniz backs tinyexr's ZIP/ZIPS decompression paths. It is C -- hence the C language
+# in project() above -- and is listed explicitly because the glob only covers src/.
+list(APPEND PROJECT_SOURCES libs/tinyexr/miniz.c)
+
 add_executable(${TARGET_NAME} ${PROJECT_SOURCES})
 if (MSVC)
 	target_compile_options(${TARGET_NAME} PRIVATE
@@ -53,6 +57,7 @@ endif()
 target_include_directories(${TARGET_NAME} PRIVATE
 	./src
 	./libs
+	./libs/tinyexr
 	${TURBOJPEG_INCLUDE_DIR}
 )
 

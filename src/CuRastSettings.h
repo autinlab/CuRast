@@ -112,6 +112,20 @@ struct CuRastSettings{
 	static inline float gtaoThickness = 1.0f;
 	// Debug: render the AO buffer as greyscale instead of the shaded image.
 	static inline bool  aoDebugView   = false;
+
+	// ----- Environment lighting -----------------------------------------------
+	// Path to an .exr or .hdr equirectangular environment map. Empty = use the
+	// studio coefficients baked into resolve.cu. Set envMapReload to have the
+	// renderer pick up a new path (loading + SH projection happen on the host).
+	static inline string envMapPath    = "";
+	static inline bool   envMapReload  = false;
+	static inline float  envExposure   = 0.85f;
+
+	// ----- AO response curve --------------------------------------------------
+	// shade = aoFloor + (1 - aoFloor) * ao^aoPower. Replaces the old fixed
+	// `ao * 0.4 + 0.6`, which compressed AO into [0.6, 1.0] and discarded most of it.
+	static inline float aoFloor = 0.25f;
+	static inline float aoPower = 1.0f;
 };
 
 // Enabling this makes CuRast allocate memory for geometry with the Vulkan API instead of CUDA.

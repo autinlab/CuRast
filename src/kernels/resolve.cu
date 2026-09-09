@@ -37,6 +37,14 @@ using glm::vec4;
 
 __constant__ RenderTarget c_target;
 
+// Environment lighting uploaded from the host (see src/EnvMap.h). When
+// c_env.enabled == 0 the shading falls back to the studio coefficients baked in
+// below, so the renderer looks the same as before if no map is loaded.
+__constant__ EnvLighting c_env;
+
+// AO response curve, uploaded from the host so it is tunable at runtime.
+__constant__ AoParams c_ao;
+
 __device__
 vec4 getVertex(CMesh& mesh, uint32_t vertexIndex){
 	vec4 position;
@@ -377,10 +385,19 @@ __device__ inline void shIrradiance(vec3 N, float* out){
 	Y[8] = 0.546274f * (N.x * N.x - N.y * N.y);
 
 	out[0] = 0.0f; out[1] = 0.0f; out[2] = 0.0f;
-	for(int i = 0; i < 9; i++){
-		out[0] += c_envSH[i][0] * Y[i];
-		out[1] += c_envSH[i][1] * Y[i];
-		out[2] += c_envSH[i][2] * Y[i];
+	if(c_env.enabled != 0){
+		// Coefficients projected from a map loaded at runtime (src/EnvMap.h).
+		for(int i = 0; i < 9; i++){
+			out[0] += c_env.sh[i].x * Y[i];
+			out[1] += c_env.sh[i].y * Y[i];
+			out[2] += c_env.sh[i].z * Y[i];
+		}
+	}else{
+		for(int i = 0; i < 9; i++){
+			out[0] += c_envSH[i][0] * Y[i];
+			out[1] += c_envSH[i][1] * Y[i];
+			out[2] += c_envSH[i][2] * Y[i];
+		}
 	}
 	// A truncated SH series can ring slightly negative for high-contrast maps.
 	out[0] = fmaxf(out[0], 0.0f);
@@ -418,7 +435,9 @@ __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 	float E[3];
 	shIrradiance(N, E);
 
-	vec3 Lk = vec3(c_envKeyDir[0], c_envKeyDir[1], c_envKeyDir[2]);
+	vec3 Lk = (c_env.enabled != 0)
+		? vec3(c_env.keyDir.x, c_env.keyDir.y, c_env.keyDir.z)
+		: vec3(c_envKeyDir[0], c_envKeyDir[1], c_envKeyDir[2]);
 	vec3 H  = normalize(Lk + V);
 	float ndoth = fmaxf(dot(N, H), 0.0f);
 	float ndotl = fmaxf(dot(N, Lk), 0.0f);
@@ -433,12 +452,20 @@ __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 	float omn   = 1.0f - ndotv;
 	float rim   = ENV_RIM_INTENS * omn * omn * omn * omn;
 
+	float exposure = (c_env.enabled != 0) ? c_env.exposure : ENV_EXPOSURE;
+	float keyRGB[3];
+	if(c_env.enabled != 0){
+		keyRGB[0] = c_env.keyColor.x; keyRGB[1] = c_env.keyColor.y; keyRGB[2] = c_env.keyColor.z;
+	}else{
+		keyRGB[0] = c_envKeyColor[0]; keyRGB[1] = c_envKeyColor[1]; keyRGB[2] = c_envKeyColor[2];
+	}
+
 	uint32_t outColor = 0xff000000;
 	uint8_t* bo = (uint8_t*)&outColor;
 	for(int c = 0; c < 3; c++){
 		float albedo = srgbToLinear(float(bi[c]) * (1.0f / 255.0f));
-		float lit    = albedo * E[c] * (ENV_EXPOSURE / 3.14159265f)
-		             + c_envKeyColor[c] * (spec + rim);
+		float lit    = albedo * E[c] * (exposure / 3.14159265f)
+		             + keyRGB[c] * (spec + rim);
 		bo[c] = (uint8_t)(linearToSrgb(tonemapACES(lit)) * 255.0f + 0.5f);
 	}
 	return outColor;
@@ -663,12 +690,11 @@ __device__ float getSSAOShadingFactor(
 // Full range is used instead, with a floor so deep cavities stay readable rather
 // than crushing to black, and a power > 1 to deepen contact shadows without
 // darkening open surfaces.
-#define AO_FLOOR 0.06f
-#define AO_POWER 1.7f
-
 __device__ inline float applyAO(float ao){
 	ao = clamp(ao, 0.0f, 1.0f);
-	return AO_FLOOR + (1.0f - AO_FLOOR) * powf(ao, AO_POWER);
+	float f = clamp(c_ao.floorValue, 0.0f, 1.0f);
+	float p = fmaxf(c_ao.power, 0.01f);
+	return f + (1.0f - f) * powf(ao, p);
 }
 
 // ── GTAO (Ground Truth Ambient Occlusion) ────────────────────────────────────

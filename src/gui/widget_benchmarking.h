@@ -47,6 +47,29 @@ void makeMultiscaleSSAOControls(){
 	}
 
 	ImGui::Separator();
+	ImGui::SeparatorText("Environment lighting");
+	{
+		static char envPathBuf[512] = {};
+		static bool envPathInit = false;
+		if(!envPathInit){
+			snprintf(envPathBuf, sizeof(envPathBuf), "%s", CuRastSettings::envMapPath.c_str());
+			envPathInit = true;
+		}
+		ImGui::InputText("Env map (.exr/.hdr)", envPathBuf, sizeof(envPathBuf));
+		ImGui::SameLine();
+		if(ImGui::Button("Load")){
+			CuRastSettings::envMapPath   = envPathBuf;
+			CuRastSettings::envMapReload = true;
+		}
+		ImGui::SetItemTooltip(
+			"Equirectangular HDR map. Loading projects it to 9 SH irradiance\n"
+			"coefficients on the host; leave empty to use the studio coefficients\n"
+			"baked into resolve.cu. World up is +Z.");
+		ImGui::SliderFloat("Env exposure", &CuRastSettings::envExposure, 0.05f, 4.0f,
+			"%.2f", ImGuiSliderFlags_Logarithmic);
+	}
+
+	ImGui::Separator();
 	ImGui::Combo("AO algorithm", &CuRastSettings::aoMode,
 		"Hemisphere (legacy)\0GTAO\0\0");
 	ImGui::SetItemTooltip(
@@ -55,6 +78,13 @@ void makeMultiscaleSSAOControls(){
 		"lower noise per unit cost. It has ONE radius -- the close/far level structure\n"
 		"below applies only to the legacy path.");
 	ImGui::Checkbox("Debug: show AO buffer", &CuRastSettings::aoDebugView);
+
+	ImGui::SliderFloat("AO floor", &CuRastSettings::aoFloor, 0.0f, 1.0f);
+	ImGui::SetItemTooltip("How dark a fully occluded pixel is allowed to get.");
+	ImGui::SliderFloat("AO power", &CuRastSettings::aoPower, 0.25f, 3.0f);
+	ImGui::SetItemTooltip(
+		"shade = floor + (1-floor) * ao^power. Above 1 deepens contact shadows "
+		"without darkening open surfaces.");
 
 	if(CuRastSettings::aoMode == 1){
 		ImGui::SliderFloat("Radius (frac. of depth)", &CuRastSettings::gtaoRadius,
