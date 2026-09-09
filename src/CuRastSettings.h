@@ -117,6 +117,9 @@ struct CuRastSettings{
 	// Flat sphere shading: albedo only, no directional term. AO and the halo still
 	// apply, so shape comes from occlusion and outlines -- the illustrative look.
 	static inline bool  flatSpheres  = false;
+	// Flat shading drops the directional term, which carries much of the average
+	// brightness, so it is lifted back to roughly the lit mode's level.
+	static inline float flatBrightness = 2.2f;
 
 	// Environment framing. Rotation spins the map about world +Z. Background widen
 	// spreads the background sample angle so more of the panorama is visible, which

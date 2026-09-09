@@ -469,8 +469,26 @@ __device__ inline float tonemapACES(float x){
 __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 	uint8_t* bi = (uint8_t*)&base;
 
+	bool flat = (c_shade.flatSpheres != 0);
+
 	float E[3];
-	shIrradiance(N, E);
+	if(flat){
+		// Flat shading: uniform irradiance, no directional term. It still runs through
+		// the same linearise -> light -> tonemap -> sRGB path as the lit mode, because
+		// passing raw sRGB albedo straight out came out much darker: the albedo never
+		// gets the exposure and filmic curve that lift the lit path's midtones, and
+		// then AO and EDL multiply it down from there.
+		E[0] = c_envSH[0][0] * 0.282095f;
+		E[1] = c_envSH[0][1] * 0.282095f;
+		E[2] = c_envSH[0][2] * 0.282095f;
+		if(c_env.enabled != 0){
+			E[0] = c_env.sh[0].x * 0.282095f;
+			E[1] = c_env.sh[0].y * 0.282095f;
+			E[2] = c_env.sh[0].z * 0.282095f;
+		}
+	}else{
+		shIrradiance(N, E);
+	}
 
 	vec3 Lk = (c_env.enabled != 0)
 		? vec3(c_env.keyDir.x, c_env.keyDir.y, c_env.keyDir.z)
@@ -480,16 +498,17 @@ __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 	float ndotl = fmaxf(dot(N, Lk), 0.0f);
 	// Gate the highlight on N.L so the far side of a sphere cannot show a
 	// specular lobe from a light it does not face.
-	float spec = (ndotl > 0.0f) ? (ENV_SPEC_INTENS * powf(ndoth, ENV_SPEC_POWER)) : 0.0f;
+	float spec = (!flat && ndotl > 0.0f) ? (ENV_SPEC_INTENS * powf(ndoth, ENV_SPEC_POWER)) : 0.0f;
 
 	// Schlick-style Fresnel rim: brightens grazing angles, which outlines each
 	// atom against its neighbours. This is the cue QuteMol gets from its
 	// depth-aware silhouettes, obtained here for a few flops.
 	float ndotv = fmaxf(dot(N, V), 0.0f);
 	float omn   = 1.0f - ndotv;
-	float rim   = ENV_RIM_INTENS * omn * omn * omn * omn;
+	float rim   = flat ? 0.0f : (ENV_RIM_INTENS * omn * omn * omn * omn);
 
 	float exposure = (c_env.enabled != 0) ? c_env.exposure : ENV_EXPOSURE;
+	if(flat) exposure *= c_shade.flatBrightness;
 	float keyRGB[3];
 	if(c_env.enabled != 0){
 		keyRGB[0] = c_env.keyColor.x; keyRGB[1] = c_env.keyColor.y; keyRGB[2] = c_env.keyColor.z;
@@ -2019,9 +2038,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 					for(int c = 0; c < 3; c++) bb[c] = (uint8_t)(float(bb[c]) * bakedAO);
 				}
 
-				color = (c_shade.flatSpheres != 0)
-					? (base | 0xff000000u)
-					: shadeEnvironment(base, N, -rayDir);
+				color = shadeEnvironment(base, N, -rayDir);
 				depth = sphere_depth;
 
 				// Stash the analytic sphere normal (in SSAO view space) for the AO

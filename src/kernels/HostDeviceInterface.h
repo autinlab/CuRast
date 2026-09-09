@@ -428,7 +428,11 @@ struct ShadeParams {
 	// Without this the toggle is nearly invisible whenever the loaded map resembles
 	// the map the baked coefficients came from.
 	int   envNeutralWhenOff;
-	float _pad2[3];
+	// Exposure multiplier for flat shading. Flat loses the directional term, which on
+	// average carries a good part of the brightness, so it needs lifting to sit at the
+	// same level as the lit mode.
+	float flatBrightness;
+	float _pad2[2];
 };
 
 #define CURAST_DEBUG_OFF        0

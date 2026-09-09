@@ -34,133 +34,168 @@ void makeSphereLodControls(){
 	}
 }
 
-void makeMultiscaleSSAOControls(){
-	if(!ImGui::CollapsingHeader("SSAO")) return;
+// The lighting and shading controls used to live inside one "SSAO" header, which
+// both buried them and made them unreachable whenever SSAO was switched off --
+// the camera and the environment have nothing to do with occlusion. One header
+// per effect instead.
 
-	ImGui::Checkbox("Enable SSAO", &CuRastSettings::enableSSAO);
+void makeCameraControls(){
+	if(!ImGui::CollapsingHeader("Camera")) return;
+
+	int projMode = CuRastSettings::orthographic ? 1 : 0;
+	if(ImGui::Combo("Projection", &projMode, "Perspective\0Orthographic\0\0")){
+		CuRastSettings::orthographic = (projMode == 1);
+	}
+	ImGui::SetItemTooltip(
+		"Orthographic removes foreshortening, so the far side of an assembly is "
+		"drawn at the same scale as the near side. The view height is derived from "
+		"the orbit distance, so switching modes keeps the framing.");
+	if(CuRastSettings::orthographic){
+		ImGui::SliderFloat("Ortho zoom", &CuRastSettings::orthoZoom, 0.05f, 4.0f,
+			"%.3f", ImGuiSliderFlags_Logarithmic);
+	}
+	ImGui::SliderInt("Supersampling", &CuRastSettings::supersamplingFactor, 1, 4);
+	ImGui::SetItemTooltip(
+		"Renders at N x resolution and downsamples. At whole-cell framing ~90 atoms "
+		"fall in each pixel and only one is kept, so aliasing is the dominant artefact "
+		"there -- often a bigger visual win than further AO tuning. Cost scales with N^2.");
+}
+
+void makeEnvironmentControls(){
+	if(!ImGui::CollapsingHeader("Environment lighting")) return;
+
+	static char envPathBuf[512] = {};
+	static bool envPathInit = false;
+	if(!envPathInit){
+		snprintf(envPathBuf, sizeof(envPathBuf), "%s", CuRastSettings::envMapPath.c_str());
+		envPathInit = true;
+	}
+
+	ImGui::Checkbox("Enable##env", &CuRastSettings::envEnabled);
+	ImGui::SetItemTooltip(
+		"Off gives a uniform ambient, so the toggle shows what the environment "
+		"actually contributes. The loaded map is kept, so switching back on is free.");
 	ImGui::SameLine();
-	ImGui::Checkbox("Multiscale", &CuRastSettings::enableMultiscaleSSAO);
-
-	if(!CuRastSettings::enableSSAO){
-		ImGui::TextDisabled("(SSAO disabled — enable it above to tune)");
-		return;
-	}
-
-	ImGui::Separator();
-	ImGui::SeparatorText("Baked per-atom AO (QuteMol style)");
-	ImGui::Checkbox("Enable baked atom AO", &CuRastSettings::atomAOEnabled);
+	ImGui::Checkbox("Show background", &CuRastSettings::envShowBackground);
 	ImGui::SetItemTooltip(
-		"Object-space AO baked once at load, one byte per atom. View-independent, so it "
-		"supplies the large-scale enclosure that screen-space AO cannot see when ~90 "
-		"atoms share a pixel. Multiplies with GTAO. First enable triggers the bake.");
-	if(CuRastSettings::atomAOEnabled){
-		ImGui::SliderInt("Bake directions", &CuRastSettings::atomAODirections, 8, 256);
-		ImGui::SliderInt("Bake resolution", &CuRastSettings::atomAOResolution, 512, 8192);
-		ImGui::SliderFloat("Baked AO intensity", &CuRastSettings::atomAOIntensity, 0.25f, 4.0f);
-		ImGui::TextDisabled("Changing directions/resolution needs a reload to re-bake.");
-	}
+		"Draw the map behind the model. Off keeps the environment lighting the scene "
+		"but leaves the background the solid colour -- usually what you want for a figure.");
 
-	ImGui::Separator();
-	ImGui::SeparatorText("Halo (QuteMol edge cueing)");
-	ImGui::Checkbox("Enable halo", &CuRastSettings::haloEnabled);
+	ImGui::InputText("Map (.exr/.hdr)", envPathBuf, sizeof(envPathBuf));
+	ImGui::SameLine();
+	if(ImGui::Button("Load##env")){
+		CuRastSettings::envMapPath   = envPathBuf;
+		CuRastSettings::envMapReload = true;
+	}
 	ImGui::SetItemTooltip(
-		"Dark glow where a silhouette stands in front of something far behind it. "
-		"QuteMol draws an enlarged billboard per atom; this is the screen-space "
-		"equivalent over the depth buffer, which is the only version that scales here.");
-	if(CuRastSettings::haloEnabled){
-		ImGui::SliderFloat("Halo size", &CuRastSettings::haloSize, 0.001f, 0.08f, "%.4f");
-		ImGui::SliderFloat("Halo strength", &CuRastSettings::haloStrength, 0.0f, 1.0f);
-		ImGui::SliderFloat("Halo colour", &CuRastSettings::haloColor, 0.0f, 1.0f);
-		ImGui::SetItemTooltip("0 = black (QuteMol default), 1 = white for a glow on dark backgrounds.");
-		ImGui::SliderFloat("Depth for full halo", &CuRastSettings::haloDepthFull,
-			0.001f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
-		ImGui::SetItemTooltip(
-			"Depth gap that produces a fully opaque halo, as a fraction of pixel depth. "
-			"Larger values restrict the halo to big silhouette jumps.");
-		ImGui::SliderInt("Halo dirs",  &CuRastSettings::haloDirs,  4, 32);
-		ImGui::SliderInt("Halo steps", &CuRastSettings::haloSteps, 1, 12);
-		ImGui::Text("Halo taps / pixel: %d", CuRastSettings::haloDirs * CuRastSettings::haloSteps);
-	}
+		"Equirectangular HDR map, projected to 9 SH irradiance coefficients on the "
+		"host. Empty uses the studio coefficients baked into resolve.cu. World up is +Z.");
 
-	ImGui::Separator();
-	ImGui::SeparatorText("Camera");
-	{
-		int projMode = CuRastSettings::orthographic ? 1 : 0;
-		if(ImGui::Combo("Projection", &projMode, "Perspective\0Orthographic\0\0")){
-			CuRastSettings::orthographic = (projMode == 1);
-		}
-		ImGui::SetItemTooltip(
-			"Orthographic removes foreshortening, so the far side of an assembly is "
-			"drawn at the same scale as the near side. The view height is derived from "
-			"the orbit distance, so switching modes keeps the framing.");
-		if(CuRastSettings::orthographic){
-			ImGui::SliderFloat("Ortho zoom", &CuRastSettings::orthoZoom, 0.05f, 4.0f,
-				"%.3f", ImGuiSliderFlags_Logarithmic);
-		}
-	}
-
-	ImGui::Separator();
-	ImGui::SeparatorText("Environment lighting");
-	{
-		static char envPathBuf[512] = {};
-		static bool envPathInit = false;
-		if(!envPathInit){
-			snprintf(envPathBuf, sizeof(envPathBuf), "%s", CuRastSettings::envMapPath.c_str());
-			envPathInit = true;
-		}
-		ImGui::Checkbox("Environment lighting", &CuRastSettings::envEnabled);
-		ImGui::SetItemTooltip(
-			"Off falls back to the studio SH coefficients baked into resolve.cu. "
-			"The loaded map is kept, so toggling back on is free.");
-		ImGui::SameLine();
-		ImGui::Checkbox("Show background", &CuRastSettings::envShowBackground);
-		ImGui::SetItemTooltip(
-			"Draw the map behind the model. Off keeps the environment lighting the "
-			"scene but leaves the background the solid colour -- usually what you want "
-			"for a figure.");
-
-		ImGui::InputText("Env map (.exr/.hdr)", envPathBuf, sizeof(envPathBuf));
-		ImGui::SameLine();
-		if(ImGui::Button("Load")){
-			CuRastSettings::envMapPath   = envPathBuf;
-			CuRastSettings::envMapReload = true;
-		}
-		ImGui::SetItemTooltip(
-			"Equirectangular HDR map. Loading projects it to 9 SH irradiance\n"
-			"coefficients on the host; leave empty to use the studio coefficients\n"
-			"baked into resolve.cu. World up is +Z.");
-		ImGui::SliderFloat("Env exposure", &CuRastSettings::envExposure, 0.05f, 4.0f,
-			"%.2f", ImGuiSliderFlags_Logarithmic);
-		ImGui::SliderFloat("Env rotation", &CuRastSettings::envRotation, 0.0f, 360.0f, "%.0f deg");
-		ImGui::SliderFloat("Background widen", &CuRastSettings::envBgWiden, 1.0f, 8.0f, "%.2f");
-		ImGui::SetItemTooltip(
-			"An environment map sits at infinity, so at a 60 degree fov you see only "
-			"about a sixth of the panorama and whatever is behind the model looks "
-			"enormous. Widening shows more of the map so its features read smaller. "
-			"Framing only -- the lighting is unaffected.");
-	}
-
-	ImGui::Separator();
-	ImGui::Checkbox("Flat sphere shading", &CuRastSettings::flatSpheres);
+	ImGui::SliderFloat("Exposure", &CuRastSettings::envExposure, 0.05f, 4.0f,
+		"%.2f", ImGuiSliderFlags_Logarithmic);
+	ImGui::SliderFloat("Rotation", &CuRastSettings::envRotation, 0.0f, 360.0f, "%.0f deg");
+	ImGui::SetItemTooltip("Rotates the lighting and the background together.");
+	ImGui::SliderFloat("Background widen", &CuRastSettings::envBgWiden, 1.0f, 8.0f, "%.2f");
 	ImGui::SetItemTooltip(
-		"Albedo only, no directional lighting. AO and the halo still apply, so shape "
-		"comes from occlusion and outlines rather than from a light -- the illustrative "
-		"look used by QuteMol presets and molstar's flat style.");
+		"An environment map sits at infinity, so at a 60 degree fov you see only about "
+		"a sixth of the panorama and whatever is behind the model looks enormous. "
+		"Widening shows more of the map so its features read smaller. Framing only.");
+}
 
-	ImGui::Separator();
-	ImGui::Combo("AO algorithm", &CuRastSettings::aoMode,
-		"Hemisphere (legacy)\0GTAO\0\0");
+void makeShadingControls(){
+	if(!ImGui::CollapsingHeader("Shading")) return;
+
+	ImGui::Checkbox("Flat spheres", &CuRastSettings::flatSpheres);
 	ImGui::SetItemTooltip(
-		"GTAO searches for the horizon in screen space and integrates the visibility\n"
-		"analytically per slice, instead of sampling points in the hemisphere. Much\n"
-		"lower noise per unit cost. It has ONE radius -- the close/far level structure\n"
-		"below applies only to the legacy path.");
+		"No directional term: uniform irradiance only. AO and the halo still apply, so "
+		"shape comes from occlusion and outlines rather than from a light -- the "
+		"illustrative look.");
+	if(CuRastSettings::flatSpheres){
+		ImGui::SliderFloat("Flat brightness", &CuRastSettings::flatBrightness, 0.5f, 5.0f);
+		ImGui::SetItemTooltip(
+			"Flat loses the directional term, which carries much of the average "
+			"brightness, so it is lifted back to roughly the lit mode's level.");
+	}
+
+	ImGui::Checkbox("EDL", &CuRastSettings::enableEDL);
+	ImGui::SetItemTooltip(
+		"Eye-dome lighting: darkens depth discontinuities. Overlaps with the halo, and "
+		"on dense atomic scenes it darkens nearly every pixel, so it is worth switching "
+		"off while comparing anything else.");
+
 	ImGui::Combo("Debug view", &CuRastSettings::debugView,
 		"Off\0AO buffer\0Normals\0Impostor hit / fallback\0\0");
 	ImGui::SetItemTooltip(
 		"Normals: a correct impostor buffer looks like a field of tiny shaded spheres; "
 		"a flat wash of one colour means the sub-pixel fallback dominates.\n"
 		"Impostor: green = analytic ray-sphere hit, red = fallback.");
+}
+
+void makeBakedAOControls(){
+	if(!ImGui::CollapsingHeader("Baked atom AO (QuteMol)")) return;
+
+	ImGui::Checkbox("Enable##bakedao", &CuRastSettings::atomAOEnabled);
+	ImGui::SetItemTooltip(
+		"Object-space AO baked once at load, one byte per atom. View-independent, so it "
+		"supplies the large-scale enclosure that screen-space AO cannot see when ~90 "
+		"atoms share a pixel. Multiplies with GTAO. First enable triggers the bake.");
+
+	if(!CuRastSettings::atomAOEnabled) return;
+
+	ImGui::SliderInt("Bake directions", &CuRastSettings::atomAODirections, 8, 256);
+	ImGui::SliderInt("Bake resolution", &CuRastSettings::atomAOResolution, 512, 8192);
+	ImGui::SetItemTooltip(
+		"Sweep buffer is resolution^2 and spans the whole bounding diagonal, so "
+		"replicating the model spreads the same grid over a larger extent. Raise this "
+		"after replicating, or surface atoms compete for pixels and come out dark.");
+	ImGui::SliderFloat("Intensity##bakedao", &CuRastSettings::atomAOIntensity, 0.25f, 4.0f);
+	ImGui::TextDisabled("Directions/resolution changes need a reload to re-bake.");
+}
+
+void makeHaloControls(){
+	if(!ImGui::CollapsingHeader("Halo / edge cueing (QuteMol)")) return;
+
+	ImGui::Checkbox("Enable##halo", &CuRastSettings::haloEnabled);
+	ImGui::SetItemTooltip(
+		"Dark glow where a silhouette stands in front of something far behind it. "
+		"QuteMol draws an enlarged billboard per atom; this is the screen-space "
+		"equivalent over the depth buffer, which is the only version that scales here.");
+
+	if(!CuRastSettings::haloEnabled) return;
+
+	ImGui::SliderFloat("Size##halo", &CuRastSettings::haloSize, 0.001f, 0.08f, "%.4f");
+	ImGui::SliderFloat("Strength##halo", &CuRastSettings::haloStrength, 0.0f, 1.0f);
+	ImGui::SliderFloat("Colour##halo", &CuRastSettings::haloColor, 0.0f, 1.0f);
+	ImGui::SetItemTooltip("0 = black (QuteMol default), 1 = white for a glow on dark backgrounds.");
+	ImGui::SliderFloat("Depth for full halo", &CuRastSettings::haloDepthFull,
+		0.001f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
+	ImGui::SetItemTooltip(
+		"Depth gap that produces a fully opaque halo, as a fraction of pixel depth. "
+		"Larger values restrict the halo to big silhouette jumps.");
+	ImGui::SliderInt("Dirs##halo",  &CuRastSettings::haloDirs,  4, 32);
+	ImGui::SliderInt("Steps##halo", &CuRastSettings::haloSteps, 1, 12);
+	ImGui::Text("Halo taps / pixel: %d", CuRastSettings::haloDirs * CuRastSettings::haloSteps);
+}
+
+void makeMultiscaleSSAOControls(){
+	if(!ImGui::CollapsingHeader("Ambient occlusion (screen space)")) return;
+
+	ImGui::Checkbox("Enable SSAO", &CuRastSettings::enableSSAO);
+	ImGui::SameLine();
+	ImGui::Checkbox("Multiscale", &CuRastSettings::enableMultiscaleSSAO);
+
+	if(!CuRastSettings::enableSSAO){
+		ImGui::TextDisabled("(SSAO disabled - enable it above to tune)");
+		return;
+	}
+
+	ImGui::Combo("AO algorithm", &CuRastSettings::aoMode,
+		"Hemisphere (legacy)\0GTAO\0\0");
+	ImGui::SetItemTooltip(
+		"GTAO searches for the horizon in screen space and integrates the visibility "
+		"analytically per slice, instead of sampling points in the hemisphere. Much "
+		"lower noise per unit cost. It has ONE radius -- the close/far level structure "
+		"below applies only to the legacy path.");
 
 	ImGui::SliderFloat("AO floor", &CuRastSettings::aoFloor, 0.0f, 1.0f);
 	ImGui::SetItemTooltip("How dark a fully occluded pixel is allowed to get.");
@@ -173,12 +208,12 @@ void makeMultiscaleSSAOControls(){
 		ImGui::SliderFloat("Radius (frac. of depth)", &CuRastSettings::gtaoRadius,
 			0.002f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
 		ImGui::SetItemTooltip(
-			"World radius = depth * this, so the screen footprint stays constant with\n"
-			"distance. The large-scale shape cue lives here: small values only find the\n"
+			"World radius = depth * this, so the screen footprint stays constant with "
+			"distance. The large-scale shape cue lives here: small values only find the "
 			"cavities between neighbouring atoms.");
 		ImGui::SliderInt  ("Slices",    &CuRastSettings::gtaoSlices, 1, 8);
 		ImGui::SliderInt  ("Steps/side",&CuRastSettings::gtaoSteps,  2, 24);
-		ImGui::SliderFloat("Intensity", &CuRastSettings::gtaoIntensity, 0.0f, 3.0f);
+		ImGui::SliderFloat("Intensity##gtao", &CuRastSettings::gtaoIntensity, 0.0f, 3.0f);
 		ImGui::SliderFloat("Thickness", &CuRastSettings::gtaoThickness, 0.25f, 3.0f);
 		ImGui::Text("Depth taps / pixel: %d",
 			CuRastSettings::gtaoSlices * CuRastSettings::gtaoSteps * 2);
@@ -408,7 +443,12 @@ void makeBenchmarking(){
 			}
 
 			makeSphereLodControls();
+			makeCameraControls();
+			makeEnvironmentControls();
+			makeShadingControls();
 			makeMultiscaleSSAOControls();
+			makeBakedAOControls();
+			makeHaloControls();
 
 			string strMeasure;
 			if(Benchmarking::measurementCountdown >= 0){
