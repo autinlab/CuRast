@@ -1139,6 +1139,14 @@ void VKRenderer::loop(
 			Runtime::controls->update();
 			camera->world = Runtime::controls->world;
 			camera->position = camera->world * glm::dvec4(0.0, 0.0, 0.0, 1.0);
+
+			// Orthographic framing follows the orbit distance, so dollying in and out
+			// zooms as the user expects instead of leaving the view volume fixed.
+			camera->orthographic = CuRastSettings::orthographic;
+			camera->orbitRadius  = Runtime::controls->radius;
+			camera->orthoHalfH   = Runtime::controls->radius
+			                     * tan(glm::pi<double>() * camera->fovy / 360.0)
+			                     * CuRastSettings::orthoZoom;
 		}
 
 		ImGui_ImplVulkan_NewFrame();

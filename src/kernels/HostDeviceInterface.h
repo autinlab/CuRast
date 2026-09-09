@@ -142,7 +142,19 @@ struct RenderTarget{
 	float f;
 	float aspect;
 	bool debug;
+
+	// Projection mode. In BOTH modes proj[0][0] and proj[1][1] are the view-space ->
+	// NDC scale factors; the only difference is whether the result is divided by
+	// depth. Perspective: ndc = proj[i][i] * v / depth. Orthographic: ndc = proj[i][i]
+	// * v, with proj[i][i] = 1 / half-extent. Keeping that shared shape means every
+	// projection site needs one branch rather than a separate code path.
+	int   projMode;    // 0 = perspective, 1 = orthographic
+	float orthoHalfH;  // orthographic half-height in world units (0 in perspective)
 };
+
+// True when the render target is orthographic. Free function so the branch reads the
+// same on host and device.
+#define CURAST_ORTHO(target) ((target).projMode == 1)
 
 struct Uniforms{
 	mat4 world;
@@ -352,7 +364,16 @@ struct EnvLighting {
 	vec4 keyColor;   // xyz = that region's colour, normalised to peak 1
 	float exposure;  // scales the SH irradiance
 	int   enabled;   // 0 = use the built-in studio coefficients compiled into resolve.cu
-	float _pad[2];
+
+	// Equirectangular radiance for drawing the map as a background. Kept separate from
+	// `enabled` on purpose: lighting a scene with an environment and *showing* that
+	// environment are independent choices, and for molecular figures you usually want
+	// the former without the latter.
+	vec4* pixels;         // device RGBA32F, row-major, null = nothing to draw
+	int   texWidth;
+	int   texHeight;
+	int   showBackground; // 0 = keep the lighting, draw the solid background colour
+	int   _pad;
 };
 
 extern __constant__ EnvLighting c_env;
@@ -368,6 +389,33 @@ struct AoParams {
 };
 
 extern __constant__ AoParams c_ao;
+
+// QuteMol-style depth-aware halo (Tarini et al. 2006).
+//
+// QuteMol draws an enlarged billboard per atom into a half-size halo texture and, per
+// fragment, samples the scene depth behind it:
+//
+//     tmp.z = saturate((sceneDepth - fragDepth) * 1/P_depth_full)
+//     tmp.z *= radialFalloff; tmp.z *= radialFalloff;   // squared, "for smoother edges"
+//     color  = black * tmp.z + haloColour
+//
+// so the halo is strongest where a silhouette stands in front of something far behind
+// it. Reproduced here as a screen-space pass over the depth buffer instead of extra
+// billboard geometry -- at 158.9M atoms, per-atom billboards are not an option, and
+// the depth buffer already holds everything the effect needs.
+struct HaloParams {
+	int   enabled;
+	float size;       // search radius as a fraction of the smaller viewport dimension
+	float strength;   // overall opacity                          (QuteMol P_halo_str)
+	float color;      // 0 = black halo .. 1 = white halo         (QuteMol P_halo_col)
+	float depthFull;  // depth gap giving a fully opaque halo, as a fraction of depth
+	                  //                                          (QuteMol P_depth_full)
+	int   dirs;       // sparse angular samples
+	int   steps;      // radial samples per direction
+	float _pad;
+};
+
+extern __constant__ HaloParams c_halo;
 
 // Sphere LOD configuration. Each level defines a camera-distance band, an atom-skip
 // stride (atom is in level k iff sphereIdx % level[k].stride == 0), and a radius scale

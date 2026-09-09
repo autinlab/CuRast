@@ -752,6 +752,15 @@ int main(int argc, char** argv){
 	if(const char* v = getenv("CURAST_ENV_EXPOSURE")) CuRastSettings::envExposure   = (float)atof(v);
 	if(const char* v = getenv("CURAST_AO_FLOOR"))     CuRastSettings::aoFloor       = (float)atof(v);
 	if(const char* v = getenv("CURAST_AO_POWER"))     CuRastSettings::aoPower       = (float)atof(v);
+	if(const char* v = getenv("CURAST_ENV_ON"))       CuRastSettings::envEnabled        = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ENV_BG"))       CuRastSettings::envShowBackground = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ORTHO"))        CuRastSettings::orthographic      = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ORTHO_ZOOM"))   CuRastSettings::orthoZoom         = (float)atof(v);
+	if(const char* v = getenv("CURAST_HALO"))         CuRastSettings::haloEnabled       = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_HALO_SIZE"))    CuRastSettings::haloSize          = (float)atof(v);
+	if(const char* v = getenv("CURAST_HALO_STR"))     CuRastSettings::haloStrength      = (float)atof(v);
+	if(const char* v = getenv("CURAST_HALO_COL"))     CuRastSettings::haloColor         = (float)atof(v);
+	if(const char* v = getenv("CURAST_HALO_DEPTH"))   CuRastSettings::haloDepthFull     = (float)atof(v);
 
 	initScene();
 

@@ -68,6 +68,8 @@ void CuRast::inputHandling(){
 	target.height = VKRenderer::height;
 	target.view = mat4(VKRenderer::camera->view); // * scene.transform;
 	target.proj = VKRenderer::camera->proj;
+	target.projMode   = CuRastSettings::orthographic ? 1 : 0;
+	target.orthoHalfH = (float)VKRenderer::camera->orthoHalfH;
 
 	bool isCtrlDown        = Runtime::keyStates[341] != 0;
 	bool isAltDown         = Runtime::keyStates[342] != 0;

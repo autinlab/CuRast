@@ -332,6 +332,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 	target.viewI = viewI;
 	target.proj = view.proj;
 	target.cameraPos = cameraPos;
+	target.projMode   = CuRastSettings::orthographic ? 1 : 0;
+	target.orthoHalfH = (float)VKRenderer::camera->orthoHalfH;
 
 	
 
@@ -565,23 +567,63 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		{
 			static EnvLighting env = {};
 			static string loadedPath = "\x01"; // sentinel: differs from any real path, including ""
+			static CUdeviceptr cptr_envPixels = 0;
+			static bool haveMap = false;
 
 			if(CuRastSettings::envMapReload || loadedPath != CuRastSettings::envMapPath){
 				CuRastSettings::envMapReload = false;
 				loadedPath = CuRastSettings::envMapPath;
 
+				if(cptr_envPixels != 0){
+					MemoryManager::free(cptr_envPixels);
+					cptr_envPixels = 0;
+				}
+
 				if(loadedPath.empty()){
 					env = {};
 					env.exposure = CuRastSettings::envExposure;
 					env.enabled  = 0;
+					haveMap      = false;
 					println("EnvMap: using built-in studio coefficients");
 				}else{
-					env = envmap::loadAndProject(loadedPath, CuRastSettings::envExposure);
+					envmap::Image img = envmap::load(loadedPath);
+					env = envmap::project(img, CuRastSettings::envExposure);
+					haveMap = (env.enabled != 0);
+
+					if(img.ok()){
+						println("EnvMap: '{}' {}x{}", loadedPath, img.width, img.height);
+						println("EnvMap: SH Y00 = ({:.3f}, {:.3f}, {:.3f})  key dir = ({:.3f}, {:.3f}, {:.3f})",
+							env.sh[0].x, env.sh[0].y, env.sh[0].z,
+							env.keyDir.x, env.keyDir.y, env.keyDir.z);
+
+						// Keep the pixels around for the background pass. RGBA32F rather than
+						// a texture object: a manual bilinear fetch is a few lines and avoids
+						// plumbing CUDA array + texture object lifetimes through this path.
+						u64 numTexels = u64(img.width) * u64(img.height);
+						vector<vec4> rgba(numTexels);
+						for(u64 i = 0; i < numTexels; i++){
+							rgba[i] = vec4(img.rgb[i*3+0], img.rgb[i*3+1], img.rgb[i*3+2], 1.0f);
+						}
+
+						cptr_envPixels = MemoryManager::alloc(numTexels * sizeof(vec4), "envmap");
+						cuMemcpyHtoD(cptr_envPixels, rgba.data(), numTexels * sizeof(vec4));
+
+						env.texWidth  = img.width;
+						env.texHeight = img.height;
+						println("EnvMap: background buffer {} MB", (numTexels * sizeof(vec4)) / (1024*1024));
+					}
 				}
 			}
 
-			// Exposure is a live slider, so keep it in sync without reloading the map.
-			env.exposure = CuRastSettings::envExposure;
+			// Live sliders / toggles: keep in sync without reloading the map.
+			env.exposure       = CuRastSettings::envExposure;
+			env.pixels         = (vec4*)cptr_envPixels;
+			env.showBackground = CuRastSettings::envShowBackground ? 1 : 0;
+			// The master toggle only gates use of the loaded map; it never discards it,
+			// so flipping it back on costs nothing. haveMap is set from the projection
+			// result, so a path that failed to load stays disabled rather than being
+			// resurrected by the toggle.
+			env.enabled = (CuRastSettings::envEnabled && haveMap) ? 1 : 0;
 
 			CUdeviceptr cptr_env = prog->getGlobalsPointer("c_env");
 			if(cptr_env != 0) cuMemcpyHtoDAsync(cptr_env, &env, sizeof(env), 0);
@@ -591,6 +633,17 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			ao.power      = CuRastSettings::aoPower;
 			CUdeviceptr cptr_ao = prog->getGlobalsPointer("c_ao");
 			if(cptr_ao != 0) cuMemcpyHtoDAsync(cptr_ao, &ao, sizeof(ao), 0);
+
+			HaloParams halo = {};
+			halo.enabled   = CuRastSettings::haloEnabled ? 1 : 0;
+			halo.size      = CuRastSettings::haloSize;
+			halo.strength  = CuRastSettings::haloStrength;
+			halo.color     = CuRastSettings::haloColor;
+			halo.depthFull = CuRastSettings::haloDepthFull;
+			halo.dirs      = CuRastSettings::haloDirs;
+			halo.steps     = CuRastSettings::haloSteps;
+			CUdeviceptr cptr_halo = prog->getGlobalsPointer("c_halo");
+			if(cptr_halo != 0) cuMemcpyHtoDAsync(cptr_halo, &halo, sizeof(halo), 0);
 		}
 
 		// Let the first kernel in the frame be a dummy kernel to take the hit for CUDA-OpenGL interop overhead

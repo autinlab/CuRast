@@ -45,6 +45,9 @@ __constant__ EnvLighting c_env;
 // AO response curve, uploaded from the host so it is tunable at runtime.
 __constant__ AoParams c_ao;
 
+// QuteMol-style halo parameters, uploaded from the host.
+__constant__ HaloParams c_halo;
+
 __device__
 vec4 getVertex(CMesh& mesh, uint32_t vertexIndex){
 	vec4 position;
@@ -471,6 +474,198 @@ __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 	return outColor;
 }
 
+// Sample the environment map along a world-space direction.
+//
+// Equirectangular convention matches the SH projection in src/EnvMap.h: world up is
+// +Z, the top row of the image is +Z, and the horizontal axis sweeps phi about Z. If
+// these two ever disagree the background and the lighting come from different
+// orientations, which is subtle and maddening to debug.
+__device__ inline vec3 sampleEnvDirection(vec3 dir){
+	float len = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+	if(len > 0.0f){ dir.x /= len; dir.y /= len; dir.z /= len; }
+
+	float theta = acosf(clamp(dir.z, -1.0f, 1.0f));
+	float phi   = atan2f(dir.y, dir.x);
+
+	float u = (phi + 3.14159265f) * (1.0f / 6.28318531f);
+	float v = theta * (1.0f / 3.14159265f);
+
+	int W = c_env.texWidth;
+	int H = c_env.texHeight;
+	if(W <= 0 || H <= 0 || c_env.pixels == nullptr) return vec3(0.0f, 0.0f, 0.0f);
+
+	// Bilinear, wrapping in u and clamping in v.
+	float fx = u * float(W) - 0.5f;
+	float fy = v * float(H) - 0.5f;
+	int   x0 = (int)floorf(fx);
+	int   y0 = (int)floorf(fy);
+	float tx = fx - float(x0);
+	float ty = fy - float(y0);
+
+	int x1 = x0 + 1;
+	int y1 = y0 + 1;
+	x0 = ((x0 % W) + W) % W;
+	x1 = ((x1 % W) + W) % W;
+	y0 = clamp(y0, 0, H - 1);
+	y1 = clamp(y1, 0, H - 1);
+
+	vec4 c00 = c_env.pixels[y0 * W + x0];
+	vec4 c10 = c_env.pixels[y0 * W + x1];
+	vec4 c01 = c_env.pixels[y1 * W + x0];
+	vec4 c11 = c_env.pixels[y1 * W + x1];
+
+	vec3 a = vec3(c00.x, c00.y, c00.z) * (1.0f - tx) + vec3(c10.x, c10.y, c10.z) * tx;
+	vec3 b = vec3(c01.x, c01.y, c01.z) * (1.0f - tx) + vec3(c11.x, c11.y, c11.z) * tx;
+	return a * (1.0f - ty) + b * ty;
+}
+
+// Background colour for a pixel the geometry did not cover. Returns false when the
+// environment background is unavailable or switched off, leaving the caller on the
+// solid background colour.
+// Defined below with the rest of the ray generation; declared here so the background
+// uses the identical generator rather than a second copy that could drift from it.
+__device__ inline vec3 computeRayDirection(float px, float py, float width, float height);
+
+__device__ inline bool envBackgroundColor(int x, int y, uint32_t* out){
+	if(c_env.enabled == 0 || c_env.showBackground == 0 || c_env.pixels == nullptr) return false;
+
+	// Same generator the primary rays use, so the background stays consistent with the
+	// geometry under both projection modes. (Orthographic gives every pixel the same
+	// direction, so the background becomes a single flat colour -- which is correct:
+	// a parallel projection genuinely sees one direction of the environment.)
+	vec3 dirWorld = computeRayDirection(float(x) + 0.5f, float(y) + 0.5f,
+	                                    float(c_target.width), float(c_target.height));
+
+	vec3 radiance = sampleEnvDirection(dirWorld) * c_env.exposure;
+
+	uint32_t color = 0xff000000;
+	uint8_t* rgba = (uint8_t*)&color;
+	rgba[0] = (uint8_t)(linearToSrgb(tonemapACES(radiance.x)) * 255.0f + 0.5f);
+	rgba[1] = (uint8_t)(linearToSrgb(tonemapACES(radiance.y)) * 255.0f + 0.5f);
+	rgba[2] = (uint8_t)(linearToSrgb(tonemapACES(radiance.z)) * 255.0f + 0.5f);
+
+	*out = color;
+	return true;
+}
+
+// ── Primary ray generation ───────────────────────────────────────────────────
+//
+// Perspective: every ray starts at the eye, the direction varies per pixel.
+// Orthographic: the direction is constant and the ORIGIN varies per pixel.
+//
+// Both halves matter. The resolve pass traces four neighbouring rays to get UV
+// derivatives for mip selection; under orthographic those rays are parallel, so
+// keeping one shared origin would make all four identical and collapse the
+// derivatives to zero.
+__device__ inline vec3 computeRayOrigin(float px, float py, float width, float height){
+	vec3 eye = vec3(c_target.viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f));
+	if(!CURAST_ORTHO(c_target)) return eye;
+
+	float u = 2.0f * px / width  - 1.0f;
+	float v = 2.0f * py / height - 1.0f;
+	vec3 posView = vec3(u / c_target.proj[0][0], v / c_target.proj[1][1], 0.0f);
+	return vec3(c_target.viewI * vec4(posView, 1.0f));
+}
+
+__device__ inline vec3 computeRayDirection(float px, float py, float width, float height){
+	vec3 eye = vec3(c_target.viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f));
+
+	if(CURAST_ORTHO(c_target)){
+		// Camera forward in world space. w=1 on both points and subtract, matching the
+		// vec4 usage elsewhere in this file (the 4-float vec4 ctor is avoided
+		// deliberately -- see the note on worldNormalToSsaoView).
+		vec3 ahead = vec3(c_target.viewI * vec4(vec3(0.0f, 0.0f, -1.0f), 1.0f));
+		return normalize(ahead - eye);
+	}
+
+	float u = 2.0f * px / width  - 1.0f;
+	float v = 2.0f * py / height - 1.0f;
+	vec3 dirView = normalize(vec3(u / c_target.proj[0][0], v / c_target.proj[1][1], -1.0f));
+	return normalize(vec3(c_target.viewI * vec4(dirView, 1.0f)) - eye);
+}
+
+// Strength of the QuteMol-style halo at one pixel, in [0,1].
+//
+// Screen-space reformulation of QuteMol's billboard pass: instead of rasterising an
+// enlarged quad per atom, look outward from this pixel for a surface that is NEARER
+// than it. If one exists, this pixel is "behind a silhouette" and takes a halo whose
+// opacity follows the depth gap, exactly as the original scales by 1/P_depth_full.
+//
+// The radial falloff is squared, matching the original's two multiplies -- QuteMol's
+// comment on the second one is "again for smoother edges", and it does visibly matter:
+// a linear falloff leaves a hard ring at the search radius.
+//
+// Sampling is sparse (dirs x steps) because the result is a max over the neighbourhood
+// and the falloff is smooth, so a dense scan buys nothing. QuteMol reached the same
+// conclusion from the other direction, rendering its halo into a reduced-size texture.
+__device__ inline float haloStrengthAt(int x, int y, float centerDepth){
+	if(c_halo.enabled == 0 || c_halo.strength <= 0.0f) return 0.0f;
+
+	int   W = c_target.width;
+	int   H = c_target.height;
+	float radiusPx = c_halo.size * float(min(W, H));
+	if(radiusPx < 1.0f) return 0.0f;
+
+	int nDirs  = max(c_halo.dirs, 1);
+	int nSteps = max(c_halo.steps, 1);
+
+	bool centerIsBackground = isinf(centerDepth);
+
+	// Rotate the sample pattern per pixel, otherwise the sparse directions show up as
+	// a star-shaped artefact around isolated silhouettes.
+	uint32_t h = uint32_t(x) * 2246822519u ^ uint32_t(y) * 3266489917u;
+	h ^= h >> 13; h *= 0xbf58476du; h ^= h >> 31;
+	float rot = float(h >> 8) * (6.28318531f / float(1 << 24));
+
+	float best = 0.0f;
+
+	for(int d = 0; d < nDirs; d++){
+		float ang = rot + float(d) * (6.28318531f / float(nDirs));
+		float dx = cosf(ang);
+		float dy = sinf(ang);
+
+		for(int s = 1; s <= nSteps; s++){
+			float t  = float(s) / float(nSteps);
+			int   sx = int(float(x) + dx * radiusPx * t);
+			int   sy = int(float(y) + dy * radiusPx * t);
+			if(sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+
+			float dN = __uint_as_float(c_target.colorbuffer[toFramebufferIndex(sx, sy, W)] >> 32);
+			if(isinf(dN)) continue;   // neighbour is background: nothing to cast a halo
+
+			// Gap to a NEARER neighbour. Background has no finite depth, so it takes the
+			// full gap from any geometry it sees -- which is the common case and the one
+			// that produces the silhouette glow.
+			float g;
+			if(centerIsBackground){
+				g = 1.0f;
+			}else{
+				float gap = centerDepth - dN;
+				if(gap <= 0.0f) continue;
+				g = clamp(gap / fmaxf(c_halo.depthFull * centerDepth, 1e-6f), 0.0f, 1.0f);
+			}
+
+			float fall = 1.0f - t * t;
+			float v    = g * fall * fall;
+			if(v > best) best = v;
+		}
+	}
+
+	return clamp(best * c_halo.strength, 0.0f, 1.0f);
+}
+
+// Blend a colour toward the halo colour. Byte order matches the packed pixels.
+__device__ inline uint32_t applyHalo(uint32_t color, float strength){
+	if(strength <= 0.0f) return color;
+
+	uint8_t* rgba = (uint8_t*)&color;
+	float target = clamp(c_halo.color, 0.0f, 1.0f) * 255.0f;
+	for(int c = 0; c < 3; c++){
+		rgba[c] = (uint8_t)clamp(float(rgba[c]) * (1.0f - strength) + target * strength, 0.0f, 255.0f);
+	}
+	return color;
+}
+
 // ── SSAO Helpers ─────────────────────────────────────────────────────────────
 
 // Reconstruct view-space position from screen pixel + linear depth.
@@ -478,16 +673,21 @@ __device__ inline uint32_t shadeEnvironment(uint32_t base, vec3 N, vec3 V){
 __device__ vec3 ssao_viewPos(float px, float py, float depth, int width, int height) {
 	float ndc_x = (2.0f * (px + 0.5f) / float(width))  - 1.0f;
 	float ndc_y = (2.0f * (py + 0.5f) / float(height)) - 1.0f;
+
+	// Orthographic: the ray footprint does not widen with distance, so x and y come
+	// straight from NDC without the depth factor.
+	float scale = CURAST_ORTHO(c_target) ? 1.0f : depth;
+
 	return vec3(
-		ndc_x * depth / c_target.proj[0][0],
-		ndc_y * depth / c_target.proj[1][1],
+		ndc_x * scale / c_target.proj[0][0],
+		ndc_y * scale / c_target.proj[1][1],
 		depth
 	);
 }
 
 // Project a view-space position back to screen pixel coordinates.
 __device__ vec2 ssao_screenPos(vec3 P, int width, int height) {
-	float inv_z = 1.0f / P.z;
+	float inv_z = CURAST_ORTHO(c_target) ? 1.0f : (1.0f / P.z);
 	return vec2(
 		((c_target.proj[0][0] * P.x * inv_z) + 1.0f) * 0.5f * float(width)  - 0.5f,
 		((c_target.proj[1][1] * P.y * inv_z) + 1.0f) * 0.5f * float(height) - 0.5f
@@ -631,7 +831,10 @@ __device__ float getSSAOShadingFactor(
 
 		float radius_fraction = radius_fractions[level];
 		float bias_factor     = bias_factors[level];
-		float world_radius    = center_depth * radius_fraction;
+		// Same reference-length rule as GTAO: depth under perspective, view half-height
+		// under orthographic, where the screen-to-world scale is depth-independent.
+		float world_radius    = (CURAST_ORTHO(c_target) ? c_target.orthoHalfH : center_depth)
+		                      * radius_fraction;
 		float bias            = BIAS_FRACTION * world_radius;
 		// Decorrelate the sample direction across levels so they don't all probe
 		// the exact same ray pattern (rotating phi by pi / numLevels per level).
@@ -764,14 +967,21 @@ __device__ float getGTAOShadingFactor(
 		N = ssao_normal(x, y, center_depth, colorbuffer, width, height);
 	}
 
-	float world_radius = center_depth * radius_fraction;
+	// Under perspective the world radius scales with depth, which is what keeps the
+	// screen footprint constant. Under orthographic the screen-to-world scale does not
+	// depend on depth at all, so the reference length is the view half-height instead;
+	// using depth there collapses the search to a fraction of a pixel and the AO
+	// silently vanishes.
+	bool  isOrtho      = CURAST_ORTHO(c_target);
+	float refLength    = isOrtho ? c_target.orthoHalfH : center_depth;
+	float world_radius = refLength * radius_fraction;
 	if(world_radius <= 0.0f) return 1.0f;
 
-	// Screen-space search radius. A world offset r at depth z projects to
-	// proj[i][i] * (r/z) * 0.5 * extent pixels, and r/z is radius_fraction, so this
-	// is independent of depth.
-	float rx = c_target.proj[0][0] * radius_fraction * 0.5f * float(width);
-	float ry = c_target.proj[1][1] * radius_fraction * 0.5f * float(height);
+	// Screen-space search radius. A world offset r projects to
+	// proj[i][i] * (r / refLength) * 0.5 * extent pixels, and r / refLength is exactly
+	// radius_fraction, so this is depth-independent in both modes.
+	float rx = c_target.proj[0][0] * world_radius * 0.5f * float(width)  / (isOrtho ? 1.0f : center_depth);
+	float ry = c_target.proj[1][1] * world_radius * 0.5f * float(height) / (isOrtho ? 1.0f : center_depth);
 
 	// Per-pixel slice rotation + step jitter. Interleaving the pattern spatially
 	// lets the bilateral blur recover the between-slice directions cheaply.
@@ -1126,28 +1336,20 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	if(x >= c_target.width) return;
 	if(y >= c_target.height) return;
 
-	auto computeRayDir = [](float x, float y, float width, float height, mat4 view, mat4 proj){
-		float u = 2.0f * x / width - 1.0f;
-		float v = 2.0f * y / height - 1.0f;
-
-		mat4 viewI = inverse(view);
-		vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-		vec3 rayDir_view = normalize(vec3{
-			1.0f / proj[0][0] * u,
-			1.0f / proj[1][1] * v,
-			-1.0f
-		});
-		vec3 rayDir_world = normalize(vec3(viewI * vec4(rayDir_view, 1.0f)) - origin);
-
-		return rayDir_world;
-	};
-
 	mat4 viewI = inverse(c_target.view);
-	vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-	vec3 rayDir    = computeRayDir(float(x) + 0.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_10 = computeRayDir(float(x) + 1.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_01 = computeRayDir(float(x) + 0.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_11 = computeRayDir(float(x) + 1.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+
+	float fbW = float(c_target.width);
+	float fbH = float(c_target.height);
+
+	vec3 origin    = computeRayOrigin(float(x) + 0.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 origin_10 = computeRayOrigin(float(x) + 1.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 origin_01 = computeRayOrigin(float(x) + 0.5f, float(y) + 1.5f, fbW, fbH);
+	vec3 origin_11 = computeRayOrigin(float(x) + 1.5f, float(y) + 1.5f, fbW, fbH);
+
+	vec3 rayDir    = computeRayDirection(float(x) + 0.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 rayDir_10 = computeRayDirection(float(x) + 1.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 rayDir_01 = computeRayDirection(float(x) + 0.5f, float(y) + 1.5f, fbW, fbH);
+	vec3 rayDir_11 = computeRayDirection(float(x) + 1.5f, float(y) + 1.5f, fbW, fbH);
 
 	uint64_t pixel = c_target.framebuffer[pixelID];
 	uint64_t pixel_colorbuffer = c_target.colorbuffer[pixelID];
@@ -1261,10 +1463,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 
 			float d = dot(a_world, normal);
 
-			t    = intersectPlane(origin, rayDir,    normal, -d);
-			t_10 = intersectPlane(origin, rayDir_10, normal, -d);
-			t_01 = intersectPlane(origin, rayDir_01, normal, -d);
-			t_11 = intersectPlane(origin, rayDir_11, normal, -d);
+			t    = intersectPlane(origin,    rayDir,    normal, -d);
+			t_10 = intersectPlane(origin_10, rayDir_10, normal, -d);
+			t_01 = intersectPlane(origin_01, rayDir_01, normal, -d);
+			t_11 = intersectPlane(origin_11, rayDir_11, normal, -d);
 		}
 
 		// Store 2-component barycentric coordinates because the 3rd component is deducted from the other two.
@@ -1280,8 +1482,11 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			float denom = d00 * d11 - d01 * d01;
 			float denomI = 1.0f / denom;
 			
-			auto computeSTV = [&](float t, vec3 rayDir){
-				vec3 p = origin + t * rayDir;
+			// Takes the ray's own origin: under orthographic the four neighbouring rays
+			// are parallel and differ only in origin, so sharing one would give all
+			// four the same barycentrics and zero UV derivatives.
+			auto computeSTV = [&](vec3 rayOrigin, float t, vec3 rayDir){
+				vec3 p = rayOrigin + t * rayDir;
 				vec3 v2 = p - a_world;
 
 				float d20 = dot(v2, v0);
@@ -1293,11 +1498,11 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 
 				return stv;
 			};
-			
-			stv    = computeSTV(t, rayDir);
-			stv_10 = computeSTV(t_10, rayDir_10);
-			stv_01 = computeSTV(t_01, rayDir_01);
-			stv_11 = computeSTV(t_11, rayDir_11);
+
+			stv    = computeSTV(origin,    t,    rayDir);
+			stv_10 = computeSTV(origin_10, t_10, rayDir_10);
+			stv_01 = computeSTV(origin_01, t_01, rayDir_01);
+			stv_11 = computeSTV(origin_11, t_11, rayDir_11);
 		}
 		
 		vec2 uv    = uv_a * (1.0f - stv.x    - stv.y   ) + uv_b * stv.x    + uv_c * stv.y;
@@ -1748,7 +1953,11 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 				ssao = applyAO(ssaoShadeBuffer[pixelID]);
 			}
 
-			if(isinf(depth)) sampleColor = backgroundColor;
+			if(isinf(depth)){
+				uint32_t envColor;
+				sampleColor = envBackgroundColor(x, y, &envColor) ? envColor : backgroundColor;
+			}
+			sampleColor = applyHalo(sampleColor, haloStrengthAt(x, y, depth));
 
 			float shade = edl * ssao;
 
@@ -1933,7 +2142,11 @@ void kernel_resolve_colorbuffer_to_screenshot(
 		ssao = applyAO(ssaoShadeBuffer[pixelID]);
 	}
 
-	if(isinf(depth)) color = backgroundColor;
+	if(isinf(depth)){
+		uint32_t envColor;
+		color = envBackgroundColor(x, y, &envColor) ? envColor : backgroundColor;
+	}
+	color = applyHalo(color, haloStrengthAt(x, y, depth));
 
 	float shade = edl * ssao;
 	uint8_t* rgba = (uint8_t*)&color;
@@ -2165,28 +2378,20 @@ void kernel_resolve_jpeg(
 	if(x >= c_target.width) return;
 	if(y >= c_target.height) return;
 
-	auto computeRayDir = [](float x, float y, float width, float height, mat4 view, mat4 proj){
-		float u = 2.0f * x / width - 1.0f;
-		float v = 2.0f * y / height - 1.0f;
-
-		mat4 viewI = inverse(view);
-		vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-		vec3 rayDir_view = normalize(vec3{
-			1.0f / proj[0][0] * u,
-			1.0f / proj[1][1] * v,
-			-1.0f
-		});
-		vec3 rayDir_world = normalize(vec3(viewI * vec4(rayDir_view, 1.0f)) - origin);
-
-		return rayDir_world;
-	};
-
 	mat4 viewI = inverse(c_target.view);
-	vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-	vec3 rayDir    = computeRayDir(float(x) + 0.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_10 = computeRayDir(float(x) + 1.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_01 = computeRayDir(float(x) + 0.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_11 = computeRayDir(float(x) + 1.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+
+	float fbW = float(c_target.width);
+	float fbH = float(c_target.height);
+
+	vec3 origin    = computeRayOrigin(float(x) + 0.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 origin_10 = computeRayOrigin(float(x) + 1.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 origin_01 = computeRayOrigin(float(x) + 0.5f, float(y) + 1.5f, fbW, fbH);
+	vec3 origin_11 = computeRayOrigin(float(x) + 1.5f, float(y) + 1.5f, fbW, fbH);
+
+	vec3 rayDir    = computeRayDirection(float(x) + 0.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 rayDir_10 = computeRayDirection(float(x) + 1.5f, float(y) + 0.5f, fbW, fbH);
+	vec3 rayDir_01 = computeRayDirection(float(x) + 0.5f, float(y) + 1.5f, fbW, fbH);
+	vec3 rayDir_11 = computeRayDirection(float(x) + 1.5f, float(y) + 1.5f, fbW, fbH);
 
 	uint64_t pixel = c_target.framebuffer[pixelID];
 	uint64_t pixel_colorbuffer = c_target.colorbuffer[pixelID];
@@ -2300,10 +2505,10 @@ void kernel_resolve_jpeg(
 
 			float d = dot(a_world, normal);
 
-			t    = intersectPlane(origin, rayDir,    normal, -d);
-			t_10 = intersectPlane(origin, rayDir_10, normal, -d);
-			t_01 = intersectPlane(origin, rayDir_01, normal, -d);
-			t_11 = intersectPlane(origin, rayDir_11, normal, -d);
+			t    = intersectPlane(origin,    rayDir,    normal, -d);
+			t_10 = intersectPlane(origin_10, rayDir_10, normal, -d);
+			t_01 = intersectPlane(origin_01, rayDir_01, normal, -d);
+			t_11 = intersectPlane(origin_11, rayDir_11, normal, -d);
 		}
 
 		// Store 2-component barycentric coordinates because the 3rd component is deducted from the other two.
@@ -2319,8 +2524,11 @@ void kernel_resolve_jpeg(
 			float denom = d00 * d11 - d01 * d01;
 			float denomI = 1.0f / denom;
 			
-			auto computeSTV = [&](float t, vec3 rayDir){
-				vec3 p = origin + t * rayDir;
+			// Takes the ray's own origin: under orthographic the four neighbouring rays
+			// are parallel and differ only in origin, so sharing one would give all
+			// four the same barycentrics and zero UV derivatives.
+			auto computeSTV = [&](vec3 rayOrigin, float t, vec3 rayDir){
+				vec3 p = rayOrigin + t * rayDir;
 				vec3 v2 = p - a_world;
 
 				float d20 = dot(v2, v0);
@@ -2332,11 +2540,11 @@ void kernel_resolve_jpeg(
 
 				return stv;
 			};
-			
-			stv    = computeSTV(t, rayDir);
-			stv_10 = computeSTV(t_10, rayDir_10);
-			stv_01 = computeSTV(t_01, rayDir_01);
-			stv_11 = computeSTV(t_11, rayDir_11);
+
+			stv    = computeSTV(origin,    t,    rayDir);
+			stv_10 = computeSTV(origin_10, t_10, rayDir_10);
+			stv_01 = computeSTV(origin_01, t_01, rayDir_01);
+			stv_11 = computeSTV(origin_11, t_11, rayDir_11);
 		}
 		
 		vec2 uv    = uv_a * (1.0f - stv.x    - stv.y   ) + uv_b * stv.x    + uv_c * stv.y;

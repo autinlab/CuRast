@@ -47,6 +47,45 @@ void makeMultiscaleSSAOControls(){
 	}
 
 	ImGui::Separator();
+	ImGui::SeparatorText("Halo (QuteMol edge cueing)");
+	ImGui::Checkbox("Enable halo", &CuRastSettings::haloEnabled);
+	ImGui::SetItemTooltip(
+		"Dark glow where a silhouette stands in front of something far behind it. "
+		"QuteMol draws an enlarged billboard per atom; this is the screen-space "
+		"equivalent over the depth buffer, which is the only version that scales here.");
+	if(CuRastSettings::haloEnabled){
+		ImGui::SliderFloat("Halo size", &CuRastSettings::haloSize, 0.001f, 0.08f, "%.4f");
+		ImGui::SliderFloat("Halo strength", &CuRastSettings::haloStrength, 0.0f, 1.0f);
+		ImGui::SliderFloat("Halo colour", &CuRastSettings::haloColor, 0.0f, 1.0f);
+		ImGui::SetItemTooltip("0 = black (QuteMol default), 1 = white for a glow on dark backgrounds.");
+		ImGui::SliderFloat("Depth for full halo", &CuRastSettings::haloDepthFull,
+			0.001f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
+		ImGui::SetItemTooltip(
+			"Depth gap that produces a fully opaque halo, as a fraction of pixel depth. "
+			"Larger values restrict the halo to big silhouette jumps.");
+		ImGui::SliderInt("Halo dirs",  &CuRastSettings::haloDirs,  4, 32);
+		ImGui::SliderInt("Halo steps", &CuRastSettings::haloSteps, 1, 12);
+		ImGui::Text("Halo taps / pixel: %d", CuRastSettings::haloDirs * CuRastSettings::haloSteps);
+	}
+
+	ImGui::Separator();
+	ImGui::SeparatorText("Camera");
+	{
+		int projMode = CuRastSettings::orthographic ? 1 : 0;
+		if(ImGui::Combo("Projection", &projMode, "Perspective\0Orthographic\0\0")){
+			CuRastSettings::orthographic = (projMode == 1);
+		}
+		ImGui::SetItemTooltip(
+			"Orthographic removes foreshortening, so the far side of an assembly is "
+			"drawn at the same scale as the near side. The view height is derived from "
+			"the orbit distance, so switching modes keeps the framing.");
+		if(CuRastSettings::orthographic){
+			ImGui::SliderFloat("Ortho zoom", &CuRastSettings::orthoZoom, 0.05f, 4.0f,
+				"%.3f", ImGuiSliderFlags_Logarithmic);
+		}
+	}
+
+	ImGui::Separator();
 	ImGui::SeparatorText("Environment lighting");
 	{
 		static char envPathBuf[512] = {};
@@ -55,6 +94,17 @@ void makeMultiscaleSSAOControls(){
 			snprintf(envPathBuf, sizeof(envPathBuf), "%s", CuRastSettings::envMapPath.c_str());
 			envPathInit = true;
 		}
+		ImGui::Checkbox("Environment lighting", &CuRastSettings::envEnabled);
+		ImGui::SetItemTooltip(
+			"Off falls back to the studio SH coefficients baked into resolve.cu. "
+			"The loaded map is kept, so toggling back on is free.");
+		ImGui::SameLine();
+		ImGui::Checkbox("Show background", &CuRastSettings::envShowBackground);
+		ImGui::SetItemTooltip(
+			"Draw the map behind the model. Off keeps the environment lighting the "
+			"scene but leaves the background the solid colour -- usually what you want "
+			"for a figure.");
+
 		ImGui::InputText("Env map (.exr/.hdr)", envPathBuf, sizeof(envPathBuf));
 		ImGui::SameLine();
 		if(ImGui::Button("Load")){

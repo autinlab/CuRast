@@ -68,23 +68,30 @@ void kernel_draw_spheres(SphereRasterArgs args) {
 
 	// Cull if entirely behind near plane
 	constexpr float NEAR = 0.1f;
-	if(center_view.z + radius >= -NEAR) return;
+	bool isOrtho = CURAST_ORTHO(c_target);
+
+	// Under orthographic there is no eye to be behind: geometry at or past the camera
+	// plane still projects correctly, so only the perspective path may cull on z.
+	if(!isOrtho && center_view.z + radius >= -NEAR) return;
 
 	float depth_center = -center_view.z;
-	float depth_front  = max(depth_center - radius, NEAR);
+	float depth_front  = isOrtho ? (depth_center - radius) : max(depth_center - radius, NEAR);
 
 	// Use projection matrix for screen-space mapping (avoids needing c_target.f / aspect)
-	// proj[0][0] = f/aspect (X scale),  proj[1][1] = f (Y scale)
+	// proj[0][0] = f/aspect (X scale),  proj[1][1] = f (Y scale). Under orthographic
+	// those same slots hold 1/half-extent and the perspective divide drops out, so the
+	// projected size of an atom no longer depends on its distance.
 	float px_scale = c_target.proj[0][0];
 	float py_scale = c_target.proj[1][1];
+	float invDepth = isOrtho ? 1.0f : (1.0f / depth_center);
 
 	// NDC coordinates of sphere center
-	float cx_ndc =  px_scale * center_view.x / depth_center;
-	float cy_ndc =  py_scale * center_view.y / depth_center;
+	float cx_ndc =  px_scale * center_view.x * invDepth;
+	float cy_ndc =  py_scale * center_view.y * invDepth;
 
 	// NDC radius (using max of X/Y scale for a conservative circular bound)
-	float r_ndc_x = px_scale * radius / depth_center;
-	float r_ndc_y = py_scale * radius / depth_center;
+	float r_ndc_x = px_scale * radius * invDepth;
+	float r_ndc_y = py_scale * radius * invDepth;
 
 	float halfW = float(c_target.width)  * 0.5f;
 	float halfH = float(c_target.height) * 0.5f;

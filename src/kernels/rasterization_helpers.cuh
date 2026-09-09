@@ -94,6 +94,18 @@ vec3 worldToNDC(vec3 v, mat4 view, float f, float aspect){
 
 vec3 viewToNDC(vec3 viewSpace, float f, float aspect){
 	float depth = -viewSpace.z;
+
+	// Orthographic drops the perspective divide; proj[0][0] / proj[1][1] already hold
+	// 1/half-extent in that mode, so the scale factors come from the matrix rather than
+	// from f and aspect.
+	if(CURAST_ORTHO(c_target)){
+		return vec3{
+			c_target.proj[0][0] * viewSpace.x,
+			c_target.proj[1][1] * viewSpace.y,
+			depth
+		};
+	}
+
 	float x_ndc = (f / aspect) * viewSpace.x / depth;
 	float y_ndc = f * viewSpace.y / depth;
 

@@ -103,6 +103,50 @@ flatness?"
 Neither replaces GTAO. Baked AO has no contact detail at close framing; GTAO has no
 large-scale cue. They multiply.
 
+## Edge cueing / halo — implemented
+
+Read from `pyQuteMol` (`Qutemol/CgUtil.py`, `MakeHaloShader`). QuteMol's halo is a
+separate pass: an enlarged billboard per atom rendered into a **reduced-size** halo
+texture (`1 << powres`), and per fragment:
+
+    tmp2.x = data.z * (1 - (u^2 + v^2))            # radial falloff inside the disc
+    tmp.z  = sceneDepth - fragDepth                # gap to whatever is behind
+    tmp.z  = saturate(tmp.z * 1/P_depth_full)
+    tmp.z *= tmp2.x
+    tmp.z *= tmp2.x                                # "again for smoother edges"
+    result = black * tmp.z + haloColour
+
+So the halo is opaque exactly where a silhouette stands in front of something far
+behind it, and fades both radially and with the depth gap. Parameters are
+`P_halo_size`, `P_halo_str`, `P_halo_col`, `P_halo_aware`, `P_depth_full`.
+
+Reproduced here as a **screen-space pass over the depth buffer** rather than per-atom
+billboards, which are not an option at 158.9M atoms. For each pixel, look outward along
+`haloDirs` directions x `haloSteps` radii for a surface nearer than this one; take the
+max of `saturate(gap / depthFull) * falloff^2`. Sparse sampling is fine because the
+result is a max of a smooth function — QuteMol reached the same conclusion from the
+other direction by rendering the halo at reduced resolution.
+
+Two details that mattered:
+
+- **The squared falloff is not cosmetic.** A linear falloff leaves a visible hard ring
+  at the search radius. QuteMol's second multiply is doing real work.
+- **`depthFull` needs to be scale-relative.** Expressed as a fraction of pixel depth,
+  not an absolute distance, or it stops working the moment you dolly. At 0.02 on this
+  scene (≈52 Å at the test framing) ordinary inter-atom gaps triggered a full-strength
+  halo and the whole interior went dark; 0.06 restricts it to genuine silhouette jumps
+  while still outlining individual complexes.
+
+Note this overlaps with the existing EDL, which also darkens depth discontinuities.
+EDL is symmetric and local; the halo is one-sided (only where a *nearer* surface
+exists) and reaches much further, which is what produces the cut-out separation rather
+than a crease darkening.
+
+Still missing from the QuteMol look: `P_border_inside` / `P_border_outside`, the
+per-atom outline drawn in the atom's own shader. With analytic sphere normals already
+available in the resolve pass, that is a cheap addition — darken where `dot(N, V)`
+falls below a threshold, with the threshold widened by the local depth gap.
+
 ## Plumbing already in place
 
 `SphereRasterArgs` (`src/kernels/HostDeviceInterface.h`) is where a per-atom AO buffer

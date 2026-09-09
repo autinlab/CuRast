@@ -120,10 +120,36 @@ struct CuRastSettings{
 	static inline string envMapPath    = "";
 	static inline bool   envMapReload  = false;
 	static inline float  envExposure   = 0.85f;
+	// Master switch. Off = fall back to the studio coefficients baked into resolve.cu.
+	static inline bool   envEnabled    = true;
+	// Lighting the scene with an environment and showing that environment are separate
+	// choices; molecular figures usually want the first without the second.
+	static inline bool   envShowBackground = false;
 
 	// ----- AO response curve --------------------------------------------------
 	// shade = aoFloor + (1 - aoFloor) * ao^aoPower. Replaces the old fixed
 	// `ao * 0.4 + 0.6`, which compressed AO into [0.6, 1.0] and discarded most of it.
+	// ----- Camera -------------------------------------------------------------
+	// Orthographic removes perspective foreshortening, which is what you usually want
+	// for a figure of a large assembly: the far side of the cell is drawn at the same
+	// scale as the near side, so the silhouette reads as the true cross-section.
+	static inline bool  orthographic = false;
+	// Multiplies the orthographic half-height, which is otherwise derived from the
+	// orbit distance and fov so that toggling modes preserves framing.
+	static inline float orthoZoom    = 1.0f;
+
+	// ----- QuteMol-style halo --------------------------------------------------
+	// Depth-aware dark glow around silhouettes. QuteMol draws an enlarged billboard per
+	// atom; this is the screen-space equivalent over the depth buffer, since per-atom
+	// billboards are not an option at 158.9M atoms.
+	static inline bool  haloEnabled   = false;
+	static inline float haloSize      = 0.012f;  // fraction of the smaller viewport side
+	static inline float haloStrength  = 0.7f;
+	static inline float haloColor     = 0.0f;    // 0 = black, 1 = white
+	static inline float haloDepthFull = 0.06f;   // depth gap for a fully opaque halo
+	static inline int   haloDirs      = 12;
+	static inline int   haloSteps     = 4;
+
 	static inline float aoFloor = 0.25f;
 	static inline float aoPower = 1.0f;
 };

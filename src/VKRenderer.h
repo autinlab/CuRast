@@ -104,11 +104,27 @@ struct Camera {
 		this->aspect = double(width) / double(height);
 	}
 
+	// Orthographic mode. orthoHalfH is the half-height of the view volume in world
+	// units; when it is <= 0 the caller has not set it and update() derives one from
+	// the current fov and orbit distance so switching modes keeps roughly the same
+	// framing instead of jumping.
+	bool   orthographic = false;
+	double orthoHalfH   = 0.0;
+	double orbitRadius  = 1.0;   // set from OrbitControls, used only to derive orthoHalfH
+
 	void update() {
 		view = glm::inverse(world);
 
 		float pi = glm::pi<float>();
-		proj = Camera::createProjectionMatrix(float(near_), float(pi * fovy / 180.0), float(aspect));
+
+		if(orthographic){
+			if(orthoHalfH <= 0.0){
+				orthoHalfH = orbitRadius * tan(pi * fovy / 360.0);
+			}
+			proj = Camera::createOrthographicMatrix(float(orthoHalfH), float(aspect));
+		}else{
+			proj = Camera::createProjectionMatrix(float(near_), float(pi * fovy / 180.0), float(aspect));
+		}
 	}
 
 	vec3 getRayDir(float u, float v) {
@@ -136,6 +152,21 @@ struct Camera {
 
 	vec3 getPosition() {
 		return dvec3(inverse(view) * dvec4(0.0, 0.0, 0.0, 1.0));
+	}
+
+	// Orthographic counterpart. Only [0][0] and [1][1] are meaningful to the CUDA
+	// rasterisers, which read them as view-space -> NDC scale factors; the kernels
+	// branch on RenderTarget::projMode for whether to divide by depth. Keeping the
+	// same two slots meaningful in both modes is what makes that branch a one-liner
+	// everywhere instead of a parallel projection path.
+	inline static glm::mat4 createOrthographicMatrix(float halfHeight, float aspect) {
+		float sy = 1.0f / halfHeight;
+		float sx = sy / aspect;
+		return glm::mat4(
+			sx,   0.0f, 0.0f, 0.0f,
+			0.0f, sy,   0.0f, 0.0f,
+			0.0f, 0.0f, 0.0f, 0.0f,
+			0.0f, 0.0f, 0.0f, 1.0f);
 	}
 
 	inline static glm::mat4 createProjectionMatrix(float near_, float fovy, float aspect) {
