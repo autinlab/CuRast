@@ -48,6 +48,9 @@ __constant__ AoParams c_ao;
 // QuteMol-style halo parameters, uploaded from the host.
 __constant__ HaloParams c_halo;
 
+// Shading / diagnostic switches.
+__constant__ ShadeParams c_shade;
+
 __device__
 vec4 getVertex(CMesh& mesh, uint32_t vertexIndex){
 	vec4 position;
@@ -286,9 +289,16 @@ __device__ __forceinline__ float fractf(float x) {
 
 // ── Normal G-buffer (RGBA8) ──────────────────────────────────────────────────
 
+// Alpha byte doubles as a validity flag and a provenance tag: 0 = cleared, and
+// non-zero = a stored normal. The two non-zero values distinguish an analytic
+// ray-sphere normal from the sub-pixel fallback, which the impostor debug view reads.
+#define NORMAL_TAG_NONE     0x00u
+#define NORMAL_TAG_ANALYTIC 0xFFu
+#define NORMAL_TAG_FALLBACK 0x80u
+
 // Pack a unit normal into uint32 RGBA8. Alpha byte = 0xFF marks "valid" so the
 // SSAO can distinguish stored normals from the cleared (= 0) sentinel.
-__device__ inline uint32_t packNormalGBuf(vec3 n){
+__device__ inline uint32_t packNormalGBuf(vec3 n, uint32_t tag = NORMAL_TAG_ANALYTIC){
 	float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
 	if(len > 0.0f){ n.x /= len; n.y /= len; n.z /= len; }
 	float fr = n.x * 0.5f + 0.5f; if(fr < 0.0f) fr = 0.0f; if(fr > 1.0f) fr = 1.0f;
@@ -297,7 +307,7 @@ __device__ inline uint32_t packNormalGBuf(vec3 n){
 	uint32_t r = (uint32_t)(fr * 255.0f + 0.5f);
 	uint32_t g = (uint32_t)(fg * 255.0f + 0.5f);
 	uint32_t b = (uint32_t)(fb * 255.0f + 0.5f);
-	return r | (g << 8) | (b << 16) | 0xFF000000u;
+	return r | (g << 8) | (b << 16) | (tag << 24);
 }
 
 // Unpack a normal previously stored with packNormalGBuf. Returns vec3(0) if the
@@ -485,7 +495,10 @@ __device__ inline vec3 sampleEnvDirection(vec3 dir){
 	if(len > 0.0f){ dir.x /= len; dir.y /= len; dir.z /= len; }
 
 	float theta = acosf(clamp(dir.z, -1.0f, 1.0f));
-	float phi   = atan2f(dir.y, dir.x);
+	float phi   = atan2f(dir.y, dir.x) + c_shade.envRotation;
+
+	// Wrap phi after the rotation, otherwise the seam lands wherever the offset put it.
+	phi = phi - 6.28318531f * floorf((phi + 3.14159265f) * (1.0f / 6.28318531f));
 
 	float u = (phi + 3.14159265f) * (1.0f / 6.28318531f);
 	float v = theta * (1.0f / 3.14159265f);
@@ -536,6 +549,25 @@ __device__ inline bool envBackgroundColor(int x, int y, uint32_t* out){
 	vec3 dirWorld = computeRayDirection(float(x) + 0.5f, float(y) + 0.5f,
 	                                    float(c_target.width), float(c_target.height));
 
+	// Widen the background sample angle. An environment map is infinitely far away, so
+	// at a 60 degree fov you only ever see about a sixth of the panorama and whatever
+	// is behind the model looks enormous next to it. Spreading the direction away from
+	// the view axis shows more of the map, which shrinks its features to a plausible
+	// size. Not physical -- it is a framing control, and it does not touch the lighting.
+	if(c_shade.envBgWiden > 1.0001f || c_shade.envBgWiden < 0.9999f){
+		vec3 axis = computeRayDirection(float(c_target.width) * 0.5f, float(c_target.height) * 0.5f,
+		                                float(c_target.width), float(c_target.height));
+		float cosA = clamp(dot(dirWorld, axis), -1.0f, 1.0f);
+		float ang  = acosf(cosA) * c_shade.envBgWiden;
+		ang = fminf(ang, 3.14159265f);
+		vec3 perp = dirWorld - axis * cosA;
+		float pl = length(perp);
+		if(pl > 1e-6f){
+			perp = perp / pl;
+			dirWorld = normalize(axis * cosf(ang) + perp * sinf(ang));
+		}
+	}
+
 	vec3 radiance = sampleEnvDirection(dirWorld) * c_env.exposure;
 
 	uint32_t color = 0xff000000;
@@ -582,6 +614,47 @@ __device__ inline vec3 computeRayDirection(float px, float py, float width, floa
 	float v = 2.0f * py / height - 1.0f;
 	vec3 dirView = normalize(vec3(u / c_target.proj[0][0], v / c_target.proj[1][1], -1.0f));
 	return normalize(vec3(c_target.viewI * vec4(dirView, 1.0f)) - eye);
+}
+
+// Diagnostic visualisations, shared by the screenshot and on-screen composites.
+__device__ inline uint32_t debugViewColor(
+	int x, int y, int pixelID, float depth,
+	float* ssaoShadeBuffer, uint32_t* normalbuffer
+){
+	uint32_t out = 0xff000000;
+	uint8_t* p = (uint8_t*)&out;
+
+	if(isinf(depth)) return out;   // background stays black in every debug mode
+
+	if(c_shade.debugView == CURAST_DEBUG_AO){
+		uint8_t v = (uint8_t)(clamp(ssaoShadeBuffer[pixelID], 0.0f, 1.0f) * 255.0f + 0.5f);
+		p[0] = v; p[1] = v; p[2] = v;
+		return out;
+	}
+
+	if(normalbuffer == nullptr) return out;
+	uint32_t packed = normalbuffer[pixelID];
+	uint32_t tag    = packed >> 24;
+
+	if(c_shade.debugView == CURAST_DEBUG_NORMAL){
+		if(tag == NORMAL_TAG_NONE) return out;
+		// Show the stored normal directly, remapped from [-1,1] to [0,255]. A correct
+		// impostor normal buffer looks like a field of little shaded spheres; a flat
+		// wash of one colour means the fallback is dominating.
+		vec3 n = unpackNormalGBuf(packed);
+		p[0] = (uint8_t)clamp((n.x * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f);
+		p[1] = (uint8_t)clamp((n.y * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f);
+		p[2] = (uint8_t)clamp((n.z * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f);
+		return out;
+	}
+
+	if(c_shade.debugView == CURAST_DEBUG_IMPOSTOR){
+		if(tag == NORMAL_TAG_ANALYTIC){ p[1] = 200; }        // green: real ray-sphere hit
+		else if(tag == NORMAL_TAG_FALLBACK){ p[0] = 200; }   // red: sub-pixel fallback
+		return out;
+	}
+
+	return out;
 }
 
 // Strength of the QuteMol-style halo at one pixel, in [0,1].
@@ -1837,6 +1910,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			float sphere_depth;
 			vec3  N;
 			bool  shade_sphere = false;
+			uint32_t normalTag = NORMAL_TAG_ANALYTIC;
 
 			if(disc >= 0.0f) {
 				float t = -b - sqrtf(disc);
@@ -1849,11 +1923,39 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				}
 			}
 			if(!shade_sphere) {
-				// Sub-pixel atom: the visbuffer placed this sphere here
-				// even though the ray misses the (tiny) sphere geometry.
-				// Fall back to visbuffer depth + camera-facing normal.
+				// Sub-pixel atom: the rasteriser painted at least a half-pixel disc so
+				// the atom is not lost, but the ray misses the actual sphere.
+				//
+				// The old fallback was N = -rayDir, a normal facing straight back at the
+				// camera. Every such pixel then got identical shading, and since the
+				// normal G-buffer feeds GTAO, identical normals there too. At whole-cell
+				// framing, where most atoms are sub-pixel, that is a large part of why
+				// the image reads flat.
+				//
+				// Blend by how badly the ray missed, because the two limits want
+				// different answers:
+				//   near miss (the antialiased rim of a resolved atom) -> the true
+				//     surface normal there is grazing, perpendicular to the ray;
+				//   large miss (a genuinely sub-pixel atom painted at the rasteriser's
+				//     half-pixel floor) -> the pixel covers the whole sphere, and the
+				//     area-weighted average normal over the visible hemisphere really
+				//     is camera-facing.
+				// Picking either one alone is wrong at the other end: -rayDir everywhere
+				// flattens the rim, and the grazing normal everywhere makes every
+				// sub-pixel atom read as a dark silhouette.
 				sphere_depth = __uint_as_float((uint32_t)(sphere_val >> 32));
-				N = -rayDir;
+
+				vec3  closest = oc + rayDir * (-b);   // centre -> nearest point on the ray
+				float cl      = length(closest);
+				float missRatio = (radius > 0.0f) ? (cl / radius) : 2.0f;
+				float grazing   = clamp(2.0f - missRatio, 0.0f, 1.0f);
+
+				vec3 nGraze  = (cl > 1e-8f) ? (closest / cl) : (-rayDir);
+				vec3 blended = nGraze * grazing + (-rayDir) * (1.0f - grazing);
+				float bl = length(blended);
+				N = (bl > 1e-8f) ? (blended / bl) : (-rayDir);
+
+				normalTag = NORMAL_TAG_FALLBACK;
 				shade_sphere = true;
 			}
 
@@ -1880,7 +1982,22 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// Image-based lighting from the environment SH, plus a directional
 				// specular key and a Fresnel rim. V is the direction back toward the
 				// eye, which for a primary ray is just -rayDir.
-				color = shadeEnvironment(base, N, -rayDir);
+				// Flat shading: albedo straight through, no directional term. AO and the
+				// halo still apply in the composite, which is the illustrative look --
+				// shape comes from occlusion and outlines rather than from a light.
+				// Baked per-atom AO (QuteMol style). Object-space and view-independent, so
+				// it carries the large-scale enclosure that a screen-space method cannot see
+				// at whole-cell framing, where ~90 atoms share a pixel and the depth buffer
+				// is atom noise. Multiplies with GTAO rather than replacing it.
+				if(sphereArgs.atomAO != nullptr){
+					float bakedAO = float(sphereArgs.atomAO[sphere_idx]) * (1.0f / 255.0f);
+					uint8_t* bb = (uint8_t*)&base;
+					for(int c = 0; c < 3; c++) bb[c] = (uint8_t)(float(bb[c]) * bakedAO);
+				}
+
+				color = (c_shade.flatSpheres != 0)
+					? (base | 0xff000000u)
+					: shadeEnvironment(base, N, -rayDir);
 				depth = sphere_depth;
 
 				// Stash the analytic sphere normal (in SSAO view space) for the AO
@@ -1888,7 +2005,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// scenes — depth-gradient reconstruction only works on smooth
 				// surfaces and breaks at every silhouette edge.
 				if(normalbuffer != nullptr){
-					normalbuffer[pixelID] = packNormalGBuf(worldNormalToSsaoView(N));
+					normalbuffer[pixelID] = packNormalGBuf(worldNormalToSsaoView(N), normalTag);
 				}
 			}
 		}
@@ -1915,7 +2032,8 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 	bool enableEDL,
 	bool enableSSAO,
 	bool showInset,
-	uint32_t backgroundColor
+	uint32_t backgroundColor,
+	uint32_t* normalbuffer
 ) {
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -1958,6 +2076,10 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 				sampleColor = envBackgroundColor(x, y, &envColor) ? envColor : backgroundColor;
 			}
 			sampleColor = applyHalo(sampleColor, haloStrengthAt(x, y, depth));
+
+			if(c_shade.debugView != CURAST_DEBUG_OFF){
+				return debugViewColor(x, y, pixelID, depth, ssaoShadeBuffer, normalbuffer);
+			}
 
 			float shade = edl * ssao;
 
@@ -2098,7 +2220,7 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	int windowWidth,
 	int windowHeight,
 	uint32_t backgroundColor,
-	bool showAOBuffer
+	uint32_t* normalbuffer
 ) {
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -2116,17 +2238,10 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	float depth = __uint_as_float(pixel >> 32);
 	uint32_t color = pixel & 0xffffffff;
 
-	// Debug: write the raw AO term as greyscale. Judging AO through albedo and
-	// lighting hides whether it carries any large-scale signal at all.
-	if(showAOBuffer){
-		uint32_t g = 0xff000000;
-		if(!isinf(depth)){
-			float ao = ssaoShadeBuffer[pixelID];
-			uint8_t v = (uint8_t)(clamp(ao, 0.0f, 1.0f) * 255.0f + 0.5f);
-			uint8_t* p = (uint8_t*)&g;
-			p[0] = v; p[1] = v; p[2] = v;
-		}
-		screenshot[pixelID] = g;
+	// Diagnostic views. Judging AO or normals through albedo and lighting hides
+	// whether either carries any signal at all.
+	if(c_shade.debugView != CURAST_DEBUG_OFF){
+		screenshot[pixelID] = debugViewColor(x, y, pixelID, depth, ssaoShadeBuffer, normalbuffer);
 		return;
 	}
 

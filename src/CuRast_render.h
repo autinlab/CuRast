@@ -6,6 +6,7 @@
 
 #include "Timer.h"
 #include "EnvMap.h"
+#include "AtomAO.h"
 #include "VKRenderer.h"
 #include "TextureManager.h"
 #include "types.h"
@@ -79,7 +80,7 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 		&view.framebuffer->width,
 		&view.framebuffer->height,
 		&backgroundColor,
-		&CuRastSettings::aoDebugView
+		&cvm_normalbuffer->cptr
 	};
 	prog_resolve->launch2D("kernel_resolve_colorbuffer_to_screenshot", args, target.width, target.height);
 
@@ -644,6 +645,14 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			halo.steps     = CuRastSettings::haloSteps;
 			CUdeviceptr cptr_halo = prog->getGlobalsPointer("c_halo");
 			if(cptr_halo != 0) cuMemcpyHtoDAsync(cptr_halo, &halo, sizeof(halo), 0);
+
+			ShadeParams shade = {};
+			shade.flatSpheres = CuRastSettings::flatSpheres ? 1 : 0;
+			shade.debugView   = CuRastSettings::debugView;
+			shade.envRotation = CuRastSettings::envRotation * 3.14159265f / 180.0f;
+			shade.envBgWiden  = CuRastSettings::envBgWiden;
+			CUdeviceptr cptr_shade = prog->getGlobalsPointer("c_shade");
+			if(cptr_shade != 0) cuMemcpyHtoDAsync(cptr_shade, &shade, sizeof(shade), 0);
 		}
 
 		// Let the first kernel in the frame be a dummy kernel to take the hit for CUDA-OpenGL interop overhead
@@ -876,6 +885,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			sphereResolveArgs.colors             = nullptr;
 			sphereResolveArgs.atomTypes          = nullptr;
 			sphereResolveArgs.colorPalette       = nullptr;
+			sphereResolveArgs.atomAO             = nullptr;
 			sphereResolveArgs.lod                = frameLod;
 
 			// Collect all sphere geometry pointers for resolve-time raycast
@@ -889,6 +899,24 @@ void CuRast::draw(Scene* scene, vector<View> views){
 					sphereResolveArgs.atomTypes    = (uint8_t*)node->cptr_atomTypes;
 					sphereResolveArgs.colorPalette = (uint32_t*)node->cptr_palette;
 					sphereResolveArgs.numSpheres   = node->numSpheres;
+
+					// Bake on demand. One-time and view-independent, so it is not redone
+					// while orbiting; the result stays on the node until the scene changes.
+					if(CuRastSettings::atomAOEnabled && node->cptr_atomAO == 0){
+						atomao::BakeSettings bs;
+						bs.numDirections = CuRastSettings::atomAODirections;
+						bs.resolution    = CuRastSettings::atomAOResolution;
+						bs.intensity     = CuRastSettings::atomAOIntensity;
+
+						Box3 box = node->aabb;
+						node->cptr_atomAO = atomao::bake(
+							node->cptr_positions, node->numSpheres,
+							box.min, box.max, CuRastSettings::atomAOMaxRadius, bs);
+					}
+
+					if(CuRastSettings::atomAOEnabled){
+						sphereResolveArgs.atomAO = (uint8_t*)node->cptr_atomAO;
+					}
 				}
 			});
 
@@ -1164,7 +1192,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&CuRastSettings::enableEDL,
 				&CuRastSettings::enableSSAO,
 				&CuRastSettings::showInset,
-				&backgroundColor
+				&backgroundColor,
+				&cvm_normalbuffer->cptr
 			};
 			prog->launch2D("kernel_resolve_colorbuffer_to_opengl_2D", args, target.width, target.height);
 		}

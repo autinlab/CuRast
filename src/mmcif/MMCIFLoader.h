@@ -785,6 +785,13 @@ static shared_ptr<LoadedMmcif> load(const string& filepath, CUcontext /*ctx*/, L
 	result->aabbMin          = aabbMin;
 	result->aabbMax          = aabbMax;
 
+	// Also store the bounds on the node. They were previously only kept on the loader
+	// result, leaving SNSpheres::aabb at its default {+inf, -inf}. Anything deriving a
+	// world extent from the node -- the AO bake does -- then computes with infinities and
+	// silently produces NaN for every atom.
+	sn->aabb.min = aabbMin;
+	sn->aabb.max = aabbMax;
+
 	// Keep host arrays alive so we can rebuild GPU buffers for replication.
 	result->hostPositions     = std::move(positions);
 	result->hostRadii         = std::move(radii);

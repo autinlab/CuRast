@@ -747,7 +747,15 @@ int main(int argc, char** argv){
 	if(const char* v = getenv("CURAST_GTAO_INTENS"))  CuRastSettings::gtaoIntensity = (float)atof(v);
 	if(const char* v = getenv("CURAST_GTAO_THICK"))   CuRastSettings::gtaoThickness = (float)atof(v);
 	if(const char* v = getenv("CURAST_SSAO"))         CuRastSettings::enableSSAO    = (atoi(v) != 0);
-	if(const char* v = getenv("CURAST_AO_DEBUG"))     CuRastSettings::aoDebugView   = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_DEBUG_VIEW"))   CuRastSettings::debugView     = atoi(v);
+	if(const char* v = getenv("CURAST_FLAT"))         CuRastSettings::flatSpheres   = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ENV_ROT"))      CuRastSettings::envRotation   = (float)atof(v);
+	if(const char* v = getenv("CURAST_ENV_WIDEN"))    CuRastSettings::envBgWiden    = (float)atof(v);
+	if(const char* v = getenv("CURAST_ATOMAO"))       CuRastSettings::atomAOEnabled    = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_ATOMAO_DIRS"))  CuRastSettings::atomAODirections = atoi(v);
+	if(const char* v = getenv("CURAST_ATOMAO_RES"))   CuRastSettings::atomAOResolution = atoi(v);
+	if(const char* v = getenv("CURAST_ATOMAO_INT"))   CuRastSettings::atomAOIntensity  = (float)atof(v);
+	if(const char* v = getenv("CURAST_SS"))           CuRastSettings::supersamplingFactor = atoi(v);
 	if(const char* v = getenv("CURAST_ENVMAP"))       CuRastSettings::envMapPath    = v;
 	if(const char* v = getenv("CURAST_ENV_EXPOSURE")) CuRastSettings::envExposure   = (float)atof(v);
 	if(const char* v = getenv("CURAST_AO_FLOOR"))     CuRastSettings::aoFloor       = (float)atof(v);

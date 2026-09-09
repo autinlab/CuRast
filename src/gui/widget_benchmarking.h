@@ -47,6 +47,20 @@ void makeMultiscaleSSAOControls(){
 	}
 
 	ImGui::Separator();
+	ImGui::SeparatorText("Baked per-atom AO (QuteMol style)");
+	ImGui::Checkbox("Enable baked atom AO", &CuRastSettings::atomAOEnabled);
+	ImGui::SetItemTooltip(
+		"Object-space AO baked once at load, one byte per atom. View-independent, so it "
+		"supplies the large-scale enclosure that screen-space AO cannot see when ~90 "
+		"atoms share a pixel. Multiplies with GTAO. First enable triggers the bake.");
+	if(CuRastSettings::atomAOEnabled){
+		ImGui::SliderInt("Bake directions", &CuRastSettings::atomAODirections, 8, 256);
+		ImGui::SliderInt("Bake resolution", &CuRastSettings::atomAOResolution, 512, 8192);
+		ImGui::SliderFloat("Baked AO intensity", &CuRastSettings::atomAOIntensity, 0.25f, 4.0f);
+		ImGui::TextDisabled("Changing directions/resolution needs a reload to re-bake.");
+	}
+
+	ImGui::Separator();
 	ImGui::SeparatorText("Halo (QuteMol edge cueing)");
 	ImGui::Checkbox("Enable halo", &CuRastSettings::haloEnabled);
 	ImGui::SetItemTooltip(
@@ -117,7 +131,21 @@ void makeMultiscaleSSAOControls(){
 			"baked into resolve.cu. World up is +Z.");
 		ImGui::SliderFloat("Env exposure", &CuRastSettings::envExposure, 0.05f, 4.0f,
 			"%.2f", ImGuiSliderFlags_Logarithmic);
+		ImGui::SliderFloat("Env rotation", &CuRastSettings::envRotation, 0.0f, 360.0f, "%.0f deg");
+		ImGui::SliderFloat("Background widen", &CuRastSettings::envBgWiden, 1.0f, 8.0f, "%.2f");
+		ImGui::SetItemTooltip(
+			"An environment map sits at infinity, so at a 60 degree fov you see only "
+			"about a sixth of the panorama and whatever is behind the model looks "
+			"enormous. Widening shows more of the map so its features read smaller. "
+			"Framing only -- the lighting is unaffected.");
 	}
+
+	ImGui::Separator();
+	ImGui::Checkbox("Flat sphere shading", &CuRastSettings::flatSpheres);
+	ImGui::SetItemTooltip(
+		"Albedo only, no directional lighting. AO and the halo still apply, so shape "
+		"comes from occlusion and outlines rather than from a light -- the illustrative "
+		"look used by QuteMol presets and molstar's flat style.");
 
 	ImGui::Separator();
 	ImGui::Combo("AO algorithm", &CuRastSettings::aoMode,
@@ -127,7 +155,12 @@ void makeMultiscaleSSAOControls(){
 		"analytically per slice, instead of sampling points in the hemisphere. Much\n"
 		"lower noise per unit cost. It has ONE radius -- the close/far level structure\n"
 		"below applies only to the legacy path.");
-	ImGui::Checkbox("Debug: show AO buffer", &CuRastSettings::aoDebugView);
+	ImGui::Combo("Debug view", &CuRastSettings::debugView,
+		"Off\0AO buffer\0Normals\0Impostor hit / fallback\0\0");
+	ImGui::SetItemTooltip(
+		"Normals: a correct impostor buffer looks like a field of tiny shaded spheres; "
+		"a flat wash of one colour means the sub-pixel fallback dominates.\n"
+		"Impostor: green = analytic ray-sphere hit, red = fallback.");
 
 	ImGui::SliderFloat("AO floor", &CuRastSettings::aoFloor, 0.0f, 1.0f);
 	ImGui::SetItemTooltip("How dark a fully occluded pixel is allowed to get.");

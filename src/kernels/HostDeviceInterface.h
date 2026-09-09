@@ -417,6 +417,40 @@ struct HaloParams {
 
 extern __constant__ HaloParams c_halo;
 
+// Shading / diagnostic switches that several kernels need. A __constant__ rather than
+// kernel parameters so adding a debug mode does not churn three kernel signatures.
+struct ShadeParams {
+	int   flatSpheres;  // 1 = albedo only, no directional lighting (illustrative style)
+	int   debugView;    // see CURAST_DEBUG_* below
+	float envRotation;  // radians, about world +Z, applied to environment lookups
+	float envBgWiden;   // >1 widens the background's effective FOV so the map reads smaller
+};
+
+#define CURAST_DEBUG_OFF        0
+#define CURAST_DEBUG_AO         1
+#define CURAST_DEBUG_NORMAL     2
+// Green = analytic ray-sphere hit, red = sub-pixel fallback (normal faked as -rayDir).
+// The proportion of red is the thing to look at: where it dominates, shading and AO
+// are both running on a constant normal and the image cannot help but look flat.
+#define CURAST_DEBUG_IMPOSTOR   3
+
+extern __constant__ ShadeParams c_shade;
+
+// One sweep direction for the QuteMol-style AO bake. Passed through device memory as a
+// single struct rather than as loose vec3 kernel parameters: a 12-byte glm::vec3 by
+// value depends on host and device agreeing about struct layout inside the kernel
+// parameter block, and a mismatch there corrupts every parameter after it silently.
+struct AoSweep {
+	vec3  origin;   float _p0;
+	vec3  right;    float _p1;
+	vec3  up;       float _p2;
+	vec3  dir;      float _p3;
+	float halfExtent;
+	float depthBias;
+	float tolerance;
+	int   res;
+};
+
 // Sphere LOD configuration. Each level defines a camera-distance band, an atom-skip
 // stride (atom is in level k iff sphereIdx % level[k].stride == 0), and a radius scale
 // (typically stride^(1/scaleBias) so projected screen area stays ~constant). At render
@@ -447,6 +481,8 @@ struct SphereRasterArgs {
 	uint32_t* colors;             // GPU device ptr, RGBA8 — null when atomTypes/palette is used
 	uint8_t*  atomTypes;          // GPU device ptr, per-atom palette index (preferred path)
 	uint32_t* colorPalette;       // GPU device ptr, 256-entry RGBA8 LUT for atomTypes
+	// Baked per-atom AO (QuteMol style), 0..255. null = not baked, treat as fully open.
+	uint8_t*  atomAO;
 	uint32_t  numSpheres;
 	uint64_t* sphere_framebuffer; // separate from triangle framebuffer
 	SphereLodConfig lod;          // numLevels=0 → LOD off

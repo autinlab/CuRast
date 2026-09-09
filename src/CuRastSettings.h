@@ -110,8 +110,19 @@ struct CuRastSettings{
 	// Multiplies the search radius for the distance falloff. Below 1 makes occluders
 	// fade before the end of the march; above 1 lets far geometry keep occluding.
 	static inline float gtaoThickness = 1.0f;
-	// Debug: render the AO buffer as greyscale instead of the shaded image.
-	static inline bool  aoDebugView   = false;
+	// Diagnostic view: 0 = off, 1 = AO buffer, 2 = normal buffer, 3 = impostor mask
+	// (green = analytic ray-sphere hit, red = sub-pixel fallback).
+	static inline int   debugView    = 0;
+
+	// Flat sphere shading: albedo only, no directional term. AO and the halo still
+	// apply, so shape comes from occlusion and outlines -- the illustrative look.
+	static inline bool  flatSpheres  = false;
+
+	// Environment framing. Rotation spins the map about world +Z. Background widen
+	// spreads the background sample angle so more of the panorama is visible, which
+	// makes its features read smaller relative to the model; lighting is unaffected.
+	static inline float envRotation  = 0.0f;   // degrees
+	static inline float envBgWiden   = 3.0f;
 
 	// ----- Environment lighting -----------------------------------------------
 	// Path to an .exr or .hdr equirectangular environment map. Empty = use the
@@ -149,6 +160,16 @@ struct CuRastSettings{
 	static inline float haloDepthFull = 0.06f;   // depth gap for a fully opaque halo
 	static inline int   haloDirs      = 12;
 	static inline int   haloSteps     = 4;
+
+	// ----- QuteMol-style baked per-atom AO --------------------------------------
+	// Object-space, view-independent, one byte per atom. Baked once at load; the cost
+	// per frame is a single byte fetch. Supplies the large-scale enclosure that a
+	// screen-space method cannot see when ~90 atoms share a pixel.
+	static inline bool  atomAOEnabled    = false;
+	static inline int   atomAODirections = 64;
+	static inline int   atomAOResolution = 2048;
+	static inline float atomAOIntensity  = 1.0f;
+	static inline float atomAOMaxRadius  = 2.0f;   // world units, used as the depth slack
 
 	static inline float aoFloor = 0.25f;
 	static inline float aoPower = 1.0f;
