@@ -653,6 +653,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			shade.envBgWiden  = CuRastSettings::envBgWiden;
 			shade.envNeutralWhenOff = CuRastSettings::envNeutralWhenOff ? 1 : 0;
 			shade.flatBrightness    = CuRastSettings::flatBrightness;
+			shade.atomAOFloor       = CuRastSettings::atomAOFloor;
 			CUdeviceptr cptr_shade = prog->getGlobalsPointer("c_shade");
 			if(cptr_shade != 0) cuMemcpyHtoDAsync(cptr_shade, &shade, sizeof(shade), 0);
 		}

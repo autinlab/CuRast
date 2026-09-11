@@ -175,6 +175,10 @@ struct CuRastSettings{
 	static inline int   atomAODirections = 64;
 	static inline int   atomAOResolution = 2048;
 	static inline float atomAOIntensity  = 1.0f;
+	// Floor under the baked AO. Buried atoms bake to ~0, which is correct but turns the
+	// view black once the camera is inside the structure, where everything visible is
+	// buried. Applied at shading time, so it retunes without a re-bake.
+	static inline float atomAOFloor      = 0.35f;
 	static inline float atomAOMaxRadius  = 2.0f;   // world units, used as the depth slack
 
 	static inline float aoFloor = 0.25f;

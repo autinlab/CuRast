@@ -763,6 +763,7 @@ int main(int argc, char** argv){
 	if(const char* v = getenv("CURAST_ATOMAO_DIRS"))  CuRastSettings::atomAODirections = atoi(v);
 	if(const char* v = getenv("CURAST_ATOMAO_RES"))   CuRastSettings::atomAOResolution = atoi(v);
 	if(const char* v = getenv("CURAST_ATOMAO_INT"))   CuRastSettings::atomAOIntensity  = (float)atof(v);
+	if(const char* v = getenv("CURAST_ATOMAO_FLOOR")) CuRastSettings::atomAOFloor      = (float)atof(v);
 	if(const char* v = getenv("CURAST_SS"))           CuRastSettings::supersamplingFactor = atoi(v);
 	if(const char* v = getenv("CURAST_ENVMAP"))       CuRastSettings::envMapPath    = v;
 	if(const char* v = getenv("CURAST_ENV_EXPOSURE")) CuRastSettings::envExposure   = (float)atof(v);

@@ -432,7 +432,12 @@ struct ShadeParams {
 	// average carries a good part of the brightness, so it needs lifting to sit at the
 	// same level as the lit mode.
 	float flatBrightness;
-	float _pad2[2];
+	// Floor under the baked per-atom AO. The bake measures openness to the OUTSIDE, so
+	// atoms buried in a packed cell are legitimately near zero -- which is correct, and
+	// useless the moment the camera goes inside, where everything visible is buried and
+	// the whole view goes black. The floor keeps interior geometry readable.
+	float atomAOFloor;
+	float _pad2;
 };
 
 #define CURAST_DEBUG_OFF        0
@@ -528,7 +533,13 @@ __device__ inline float sphereLodScaledRadius(
 		if(L.stride > 1 && (sphereIdx % (uint32_t)L.stride) != 0u) continue;
 		if(dist < L.minDist || dist > L.maxDist) continue;
 
-		float fIn  = (L.overlap > 0.0f)
+		// Only cross-fade at an edge that actually hands off to another level. The
+		// first band starts at minDist = 0, so there is nothing below it to blend
+		// with, and fading there scales the radius toward zero as the camera gets
+		// closer -- backwards, and the reason atoms rendered well under their van der
+		// Waals size up close or from inside the structure. At 0.1x orbit distance
+		// that came out at half radius; at 0.01x, under one percent.
+		float fIn  = (L.overlap > 0.0f && L.minDist > 0.0f)
 			? __saturatef((dist - L.minDist) / L.overlap)
 			: 1.0f;
 		float fOut = (L.overlap > 0.0f)

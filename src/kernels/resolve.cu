@@ -2034,6 +2034,9 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// is atom noise. Multiplies with GTAO rather than replacing it.
 				if(sphereArgs.atomAO != nullptr){
 					float bakedAO = float(sphereArgs.atomAO[sphere_idx]) * (1.0f / 255.0f);
+					// Applied here rather than baked in, so it retunes without a re-bake.
+					float f = clamp(c_shade.atomAOFloor, 0.0f, 1.0f);
+					bakedAO = f + (1.0f - f) * bakedAO;
 					uint8_t* bb = (uint8_t*)&base;
 					for(int c = 0; c < 3; c++) bb[c] = (uint8_t)(float(bb[c]) * bakedAO);
 				}

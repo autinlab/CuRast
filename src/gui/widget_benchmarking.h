@@ -149,6 +149,11 @@ void makeBakedAOControls(){
 		"replicating the model spreads the same grid over a larger extent. Raise this "
 		"after replicating, or surface atoms compete for pixels and come out dark.");
 	ImGui::SliderFloat("Intensity##bakedao", &CuRastSettings::atomAOIntensity, 0.25f, 4.0f);
+	ImGui::SliderFloat("Floor##bakedao", &CuRastSettings::atomAOFloor, 0.0f, 1.0f);
+	ImGui::SetItemTooltip(
+		"Buried atoms bake to near zero, which is correct but turns the view black once "
+		"the camera is inside the structure, where everything visible is buried. Applied "
+		"at shading time, so it retunes without a re-bake.");
 	ImGui::TextDisabled("Directions/resolution changes need a reload to re-bake.");
 }
 
