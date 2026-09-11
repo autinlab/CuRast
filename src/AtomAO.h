@@ -87,12 +87,39 @@ inline CUdeviceptr bake(
 	CUdeviceptr cptr_counts = MemoryManager::alloc(uint64_t(numSpheres) * sizeof(uint32_t), "atomAO_counts");
 	CUdeviceptr cptr_ao     = MemoryManager::alloc(uint64_t(numSpheres), "atomAO");
 
+	// MemoryManager::alloc returns 0 when it refuses. Launching against that is an
+	// illegal access that takes the whole app down on the next kernel, which is exactly
+	// what happened when the bake was enabled on a heavily replicated structure: the
+	// 1.8 GB atomAO request was refused with 468 MB free, and the following launch
+	// killed the session. The counters are the big ones -- 4 bytes/atom for counts on
+	// top of 1 byte/atom for the result -- so this trips well before the GPU is full.
+	if(cptr_depth == 0 || cptr_counts == 0 || cptr_ao == 0){
+		println("AtomAO: not enough GPU memory to bake {:L} atoms "
+			"(needs ~{} MB counters + {} MB result + {} MB sweep). Skipping.",
+			numSpheres,
+			(uint64_t(numSpheres) * sizeof(uint32_t)) >> 20,
+			uint64_t(numSpheres) >> 20,
+			(numPix * sizeof(uint32_t)) >> 20);
+
+		if(cptr_depth)  MemoryManager::free(cptr_depth);
+		if(cptr_counts) MemoryManager::free(cptr_counts);
+		if(cptr_ao)     MemoryManager::free(cptr_ao);
+		return 0;
+	}
+
 	cuMemsetD8(cptr_counts, 0, uint64_t(numSpheres) * sizeof(uint32_t));
 
 	vector<vec3> dirs = fibonacciDirections(numDirs);
 
 	// Sweep parameters travel through device memory as one struct; see AoSweep.
 	CUdeviceptr cptr_sweep = MemoryManager::alloc(sizeof(AoSweep), "atomAO_sweep");
+	if(cptr_sweep == 0){
+		println("AtomAO: could not allocate the sweep struct. Skipping.");
+		MemoryManager::free(cptr_depth);
+		MemoryManager::free(cptr_counts);
+		MemoryManager::free(cptr_ao);
+		return 0;
+	}
 
 	println("AtomAO: baking {} directions at {}x{} for {:L} atoms ({} MB)",
 		numDirs, res, res, numSpheres, (uint64_t(numSpheres)) / (1024 * 1024));
@@ -135,8 +162,26 @@ inline CUdeviceptr bake(
 	// genuinely occluded almost everywhere, so only a handful of percent of atoms
 	// should be bright, and a contiguous sample can miss them entirely.
 	{
-		vector<uint8_t> all(numSpheres);
-		cuMemcpyDtoH(all.data(), cptr_ao, numSpheres);
+		// Sampled in chunks spread across the buffer rather than copied whole: at a
+		// billion-plus atoms a full copy is gigabytes of host RAM for a diagnostic, and
+		// this runs on a machine already holding the structure twice over. Chunks
+		// rather than a stride because a packed cell is occluded nearly everywhere, so
+		// the few percent of bright atoms have to be sampled from throughout the index
+		// space or the statistics look like the bake failed.
+		const uint64_t CHUNKS     = 64;
+		const uint64_t CHUNK_SIZE = 256 * 1024;
+		uint64_t total = min<uint64_t>(numSpheres, CHUNKS * CHUNK_SIZE);
+		uint64_t per   = total / CHUNKS;
+
+		vector<uint8_t> all;
+		all.reserve(total);
+		vector<uint8_t> chunk(per);
+		for(uint64_t c = 0; c < CHUNKS && per > 0; c++){
+			uint64_t offset = (uint64_t)((double(c) / double(CHUNKS)) * double(numSpheres));
+			if(offset + per > numSpheres) offset = numSpheres - per;
+			cuMemcpyDtoH(chunk.data(), cptr_ao + offset, per);
+			all.insert(all.end(), chunk.begin(), chunk.end());
+		}
 
 		uint64_t sum = 0, nonZero = 0, above64 = 0;
 		int mx = 0;
@@ -146,10 +191,12 @@ inline CUdeviceptr bake(
 			if(v > 64) above64++;
 			if(v > mx) mx = v;
 		}
-		println("AtomAO: mean={:.2f}/255 max={} nonzero={:.2f}% above64={:.2f}%",
-			double(sum) / double(numSpheres), mx,
-			100.0 * double(nonZero) / double(numSpheres),
-			100.0 * double(above64) / double(numSpheres));
+		uint64_t sampled = all.empty() ? 1 : all.size();
+		println("AtomAO: mean={:.2f}/255 max={} nonzero={:.2f}% above64={:.2f}% (sampled {:L})",
+			double(sum) / double(sampled), mx,
+			100.0 * double(nonZero) / double(sampled),
+			100.0 * double(above64) / double(sampled),
+			sampled);
 	}
 
 	return cptr_ao;

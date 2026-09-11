@@ -904,7 +904,21 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 					// Bake on demand. One-time and view-independent, so it is not redone
 					// while orbiting; the result stays on the node until the scene changes.
-					if(CuRastSettings::atomAOEnabled && node->cptr_atomAO == 0){
+					// A refused bake leaves cptr_atomAO at 0, so without this latch the
+					// attempt would repeat every frame -- re-running a multi-second bake and
+					// re-printing the refusal forever. Cleared whenever the settings change,
+					// so lowering the resolution and re-enabling still retries.
+					static bool bakeFailed  = false;
+					static int  bakedDirs   = -1;
+					static int  bakedRes    = -1;
+					if(bakedDirs != CuRastSettings::atomAODirections
+						|| bakedRes != CuRastSettings::atomAOResolution){
+						bakeFailed = false;
+						bakedDirs  = CuRastSettings::atomAODirections;
+						bakedRes   = CuRastSettings::atomAOResolution;
+					}
+
+					if(CuRastSettings::atomAOEnabled && node->cptr_atomAO == 0 && !bakeFailed){
 						atomao::BakeSettings bs;
 						bs.numDirections = CuRastSettings::atomAODirections;
 						bs.resolution    = CuRastSettings::atomAOResolution;
@@ -914,6 +928,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 						node->cptr_atomAO = atomao::bake(
 							node->cptr_positions, node->numSpheres,
 							box.min, box.max, CuRastSettings::atomAOMaxRadius, bs);
+						bakeFailed = (node->cptr_atomAO == 0);
 					}
 
 					if(CuRastSettings::atomAOEnabled){
