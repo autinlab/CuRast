@@ -527,6 +527,22 @@ void update(){
 				mmcif::loadedAll.push_back(loaded);
 				CuRastSettings::showBenchmarking = true; // open the replication slider
 
+				// Entity colouring by default. CPK element colours reduce a mesoscale model
+				// to a wash of red and grey, because at that scale you are looking at which
+				// molecular species sit where, not at which atom is oxygen. Per-entity hues
+				// show that structure directly.
+				//
+				// Costs 4 bytes/atom for the legacy colour buffer that the ELEMENT path avoids
+				// (636 MB on the 158.9M-atom cell). applyColorTheme returns false and leaves
+				// ELEMENT in place if that allocation is refused.
+				{
+					int theme = (int)mmcif::ColorTheme::ENTITY;
+					if(const char* v = getenv("CURAST_THEME")) theme = atoi(v);
+					if(theme != (int)mmcif::ColorTheme::ELEMENT){
+						mmcif::applyColorTheme(loaded.get(), (mmcif::ColorTheme)theme);
+					}
+				}
+
 				// Scripted replication, so the instanced path can be exercised without
 				// driving the GUI. Runs before the camera is framed so the framing covers
 				// the whole grid.
