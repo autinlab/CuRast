@@ -1257,6 +1257,8 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 					println("AUTOSHOT: frame={} path={}", autoshotFrame, autoshotPath);
 					for(string label : {
+						"kernel_draw_spheres",
+						"kernel_resolve_visbuffer_to_colorbuffer2D",
 						"kernel_ssaoOcclusion",
 						"kernel_gtaoOcclusion",
 						"kernel_ssaoBlur",
