@@ -1230,7 +1230,18 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			static bool autoshotDone  = false;
 			const char* autoshotPath  = getenv("CURAST_AUTOSHOT");
 
-			if(autoshotPath != nullptr && !autoshotDone){
+			// Only start counting once geometry exists. A fixed frame number is not a
+			// reliable "after loading" signal: the mmCIF load is async and its duration
+			// varies with copy count and filesystem speed, so a 4-copy run captured an
+			// empty viewport at frame 900 while the 1-copy run captured a full one.
+			bool hasGeometry = false;
+			if(scene != nullptr){
+				scene->forEach<SNSpheres>([&](SNSpheres* n){
+					if(n->numSpheres > 0) hasGeometry = true;
+				});
+			}
+
+			if(autoshotPath != nullptr && !autoshotDone && hasGeometry){
 				const char* strWhen = getenv("CURAST_AUTOSHOT_FRAME");
 				int when = (strWhen != nullptr) ? atoi(strWhen) : 150;
 

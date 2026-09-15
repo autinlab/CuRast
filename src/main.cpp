@@ -759,6 +759,11 @@ int main(int argc, char** argv){
 	// capture would otherwise report 0 ms for every kernel. Turn them on whenever a
 	// scripted capture is requested, so AUTOSHOT prints real numbers.
 	if(getenv("CURAST_AUTOSHOT") != nullptr){
+		// Set showTimingInfos, NOT measureTimings directly: widget_timings.h assigns
+		// measureTimings = showTimingInfos every frame, so a direct assignment here is
+		// overwritten before the first kernel ever records. That is why scripted captures
+		// reported no per-kernel timings at all.
+		CuRastSettings::showTimingInfos = true;
 		Runtime::measureTimings = true;
 	}
 
