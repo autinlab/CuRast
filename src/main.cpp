@@ -776,6 +776,7 @@ int main(int argc, char** argv){
 	if(const char* v = getenv("CURAST_GTAO_INTENS"))  CuRastSettings::gtaoIntensity = (float)atof(v);
 	if(const char* v = getenv("CURAST_GTAO_THICK"))   CuRastSettings::gtaoThickness = (float)atof(v);
 	if(const char* v = getenv("CURAST_SSAO"))         CuRastSettings::enableSSAO    = (atoi(v) != 0);
+	if(const char* v = getenv("CURAST_EDL"))          CuRastSettings::enableEDL     = (atoi(v) != 0);
 	if(const char* v = getenv("CURAST_DEBUG_VIEW"))   CuRastSettings::debugView     = atoi(v);
 	if(const char* v = getenv("CURAST_FLAT"))         CuRastSettings::flatSpheres   = (atoi(v) != 0);
 	if(const char* v = getenv("CURAST_ENV_ROT"))      CuRastSettings::envRotation   = (float)atof(v);

@@ -292,13 +292,26 @@ __device__ __forceinline__ float fractf(float x) {
 // Alpha byte doubles as a validity flag and a provenance tag: 0 = cleared, and
 // non-zero = a stored normal. The two non-zero values distinguish an analytic
 // ray-sphere normal from the sub-pixel fallback, which the impostor debug view reads.
-#define NORMAL_TAG_NONE     0x00u
-#define NORMAL_TAG_ANALYTIC 0xFFu
-#define NORMAL_TAG_FALLBACK 0x80u
+// Alpha byte layout: [tag:2][bakedAO:6].
+//
+// The tag lives in the top two bits so a written pixel always has a non-zero alpha,
+// which is what every "is there a normal here" test keys on. The remaining six bits
+// carry the baked per-atom AO to the composite pass.
+//
+// Six bits is ample: baked AO is a low-frequency, view-independent term, and piggy-
+// backing it here avoids a second full-resolution buffer for something the composite
+// only needs one number from.
+#define NORMAL_TAG_NONE     0x0u
+#define NORMAL_TAG_ANALYTIC 0x1u
+#define NORMAL_TAG_FALLBACK 0x2u
 
-// Pack a unit normal into uint32 RGBA8. Alpha byte = 0xFF marks "valid" so the
-// SSAO can distinguish stored normals from the cleared (= 0) sentinel.
-__device__ inline uint32_t packNormalGBuf(vec3 n, uint32_t tag = NORMAL_TAG_ANALYTIC){
+#define NORMAL_TAG_OF(v)     (((v) >> 30) & 0x3u)
+#define NORMAL_BAKEDAO_OF(v) (((v) >> 24) & 0x3Fu)
+
+// Pack a unit normal plus its baked AO. bakedAO is 0..1; 1 means "not baked", which is
+// also the identity for the min() combine in the composite.
+__device__ inline uint32_t packNormalGBuf(vec3 n, uint32_t tag = NORMAL_TAG_ANALYTIC,
+                                          float bakedAO = 1.0f){
 	float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
 	if(len > 0.0f){ n.x /= len; n.y /= len; n.z /= len; }
 	float fr = n.x * 0.5f + 0.5f; if(fr < 0.0f) fr = 0.0f; if(fr > 1.0f) fr = 1.0f;
@@ -307,7 +320,8 @@ __device__ inline uint32_t packNormalGBuf(vec3 n, uint32_t tag = NORMAL_TAG_ANAL
 	uint32_t r = (uint32_t)(fr * 255.0f + 0.5f);
 	uint32_t g = (uint32_t)(fg * 255.0f + 0.5f);
 	uint32_t b = (uint32_t)(fb * 255.0f + 0.5f);
-	return r | (g << 8) | (b << 16) | (tag << 24);
+	uint32_t ao6 = (uint32_t)(clamp(bakedAO, 0.0f, 1.0f) * 63.0f + 0.5f);
+	return r | (g << 8) | (b << 16) | (ao6 << 24) | (tag << 30);
 }
 
 // Unpack a normal previously stored with packNormalGBuf. Returns vec3(0) if the
@@ -677,7 +691,7 @@ __device__ inline uint32_t debugViewColor(
 
 	if(normalbuffer == nullptr) return out;
 	uint32_t packed = normalbuffer[pixelID];
-	uint32_t tag    = packed >> 24;
+	uint32_t tag    = NORMAL_TAG_OF(packed);
 
 	if(c_shade.debugView == CURAST_DEBUG_NORMAL){
 		if(tag == NORMAL_TAG_NONE) return out;
@@ -698,6 +712,18 @@ __device__ inline uint32_t debugViewColor(
 	}
 
 	return out;
+}
+
+// Combine the screen-space AO with the baked per-atom AO carried in the normal
+// buffer's alpha. min(), not a product: the two measure overlapping occlusion of the
+// same geometry, so multiplying them double counts and crushes anywhere both agree --
+// which is everywhere once the camera is inside a packed structure.
+__device__ inline float combineAO(float screenAO, uint32_t* normalbuffer, int pixelID){
+	if(normalbuffer == nullptr) return screenAO;
+	uint32_t packed = normalbuffer[pixelID];
+	if(NORMAL_TAG_OF(packed) == NORMAL_TAG_NONE) return screenAO;
+	float baked = float(NORMAL_BAKEDAO_OF(packed)) * (1.0f / 63.0f);
+	return fminf(screenAO, baked);
 }
 
 // Strength of the QuteMol-style halo at one pixel, in [0,1].
@@ -2032,13 +2058,18 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// it carries the large-scale enclosure that a screen-space method cannot see
 				// at whole-cell framing, where ~90 atoms share a pixel and the depth buffer
 				// is atom noise. Multiplies with GTAO rather than replacing it.
+				// Baked AO is NOT multiplied into the albedo here. Doing that stacked it
+				// with the screen-space AO applied later in the composite, and inside a
+				// packed cell both terms say "occluded" about the same geometry -- the
+				// product drove the interior to 26/255 with 9% of pixels near black. It is
+				// carried to the composite instead, which takes the minimum of the two so
+				// the most-occluded estimate wins without ever double counting.
+				float bakedAO = 1.0f;
 				if(sphereArgs.atomAO != nullptr){
-					float bakedAO = float(sphereArgs.atomAO[sphere_idx]) * (1.0f / 255.0f);
+					bakedAO = float(sphereArgs.atomAO[sphere_idx]) * (1.0f / 255.0f);
 					// Applied here rather than baked in, so it retunes without a re-bake.
 					float f = clamp(c_shade.atomAOFloor, 0.0f, 1.0f);
 					bakedAO = f + (1.0f - f) * bakedAO;
-					uint8_t* bb = (uint8_t*)&base;
-					for(int c = 0; c < 3; c++) bb[c] = (uint8_t)(float(bb[c]) * bakedAO);
 				}
 
 				color = shadeEnvironment(base, N, -rayDir);
@@ -2049,7 +2080,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				// scenes — depth-gradient reconstruction only works on smooth
 				// surfaces and breaks at every silhouette edge.
 				if(normalbuffer != nullptr){
-					normalbuffer[pixelID] = packNormalGBuf(worldNormalToSsaoView(N), normalTag);
+					normalbuffer[pixelID] = packNormalGBuf(worldNormalToSsaoView(N), normalTag, bakedAO);
 				}
 			}
 		}
@@ -2112,7 +2143,7 @@ void kernel_resolve_colorbuffer_to_opengl_2D(
 			}
 
 			if(enableSSAO){
-				ssao = applyAO(ssaoShadeBuffer[pixelID]);
+				ssao = applyAO(combineAO(ssaoShadeBuffer[pixelID], normalbuffer, pixelID));
 			}
 
 			if(isinf(depth)){
@@ -2298,7 +2329,7 @@ void kernel_resolve_colorbuffer_to_screenshot(
 	}
 
 	if(enableSSAO){
-		ssao = applyAO(ssaoShadeBuffer[pixelID]);
+		ssao = applyAO(combineAO(ssaoShadeBuffer[pixelID], normalbuffer, pixelID));
 	}
 
 	if(isinf(depth)){
